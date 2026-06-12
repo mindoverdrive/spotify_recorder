@@ -5,6 +5,13 @@ import wave
 import queue
 import numpy as np
 import sounddevice as sd
+from mutagen.id3 import ID3, TIT2, TPE1, TALB
+from mutagen.wave import WAVE
+from static_ffmpeg import add_paths
+add_paths() # pydubのインポート前にパスを通す
+
+from pydub import AudioSegment
+from pydub.silence import detect_nonsilent
 import customtkinter as ctk
 from tkinter import filedialog
 from datetime import datetime
@@ -18,13 +25,14 @@ ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("green")
 
 def get_spotify_info():
-    """Spotifyから現在の再生情報を取得 (AppleScript)"""
+    """Spotifyから現在の再生情報を取得 (AppleScript) - 診断 & ウィンドウ名フォールバック付き"""
     try:
         subprocess.check_call(['pgrep', '-x', 'Spotify'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
         return {'status': 'CLOSED'}
 
-    script = 'tell application "Spotify" to get (name of current track) & "||" & (artist of current track) & "||" & (album of current track) & "||" & (player state of current track)'
+    # Bundle IDを使用して確実にSpotifyをターゲットにする
+    script = 'tell application id "com.spotify.client" to get (name of current track) & "||" & (artist of current track) & "||" & (album of current track) & "||" & (player state of current track)'
     try:
         result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True, timeout=1)
         if result.returncode == 0:
@@ -37,9 +45,17 @@ def get_spotify_info():
                     'album': info[2],
                     'state': info[3]
                 }
-    except:
-        pass
+        else:
+            # エラー時に権限不足かどうかを確認
+            err_msg = result.stderr.strip()
+            if "not allowed" in err_msg or "許可されていません" in err_msg or "error -1743" in err_msg:
+                return {'status': 'PERMISSION_DENIED', 'error': err_msg}
+            if "error -600" in err_msg:
+                return {'status': 'CLOSED'} # AppleScript上は起動していない扱い
+    except Exception as e:
+        return {'status': 'ERROR', 'error': str(e)}
 
+    # Fallback to window title (これもSystem Eventsの許可が必要)
     fallback_script = 'tell application "System Events" to get name of first window of (first process whose name is "Spotify")'
     try:
         res_fb = subprocess.run(['osascript', '-e', fallback_script], capture_output=True, text=True, timeout=1)
@@ -57,78 +73,85 @@ def get_spotify_info():
     except:
         pass
 
-    return {'status': 'PERMISSION_DENIED'}
+    return {'status': 'PERMISSION_DENIED', 'error': 'AppleScript link failed'}
 
-def save_wav_pure(filename, audio_data, sample_rate, log_callback):
-    """保存のみ (ID3タグ・無音トリミング削除し、高音質なピュアデータを保存)"""
+def trim_silence_pydub(filename):
+    try:
+        audio = AudioSegment.from_wav(filename)
+        nonsilent_ranges = detect_nonsilent(audio, min_silence_len=500, silence_thresh=-50)
+        if nonsilent_ranges:
+            start_trim = nonsilent_ranges[0][0]
+            end_trim = nonsilent_ranges[-1][1]
+            trimmed_audio = audio[start_trim:end_trim]
+            trimmed_audio.export(filename, format="wav")
+            return f"Trimmed: {start_trim}ms - {end_trim}ms"
+        return "No silence trimmed."
+    except Exception as e:
+        return f"Trimming skipped or failed: {e}"
+
+def save_wav_with_tags(filename, audio_data, info, log_callback):
+    """保存とタグ付け (別スレッド)"""
     try:
         log_callback(f"Saving to {filename}...")
         with wave.open(filename, 'wb') as wf:
-            wf.setnchannels(2) 
-            wf.setsampwidth(2) # 16bit format
-            wf.setframerate(sample_rate)
-            wf.writeframes(audio_data.tobytes())
-        log_callback(f"Saved: {os.path.basename(filename)}")
+            wf.setnchannels(2) # 常にステレオ
+            wf.setsampwidth(2) 
+            wf.setframerate(SAMPLE_RATE)
+            int_data = (audio_data * 32767).clip(-32768, 32767).astype(np.int16)
+            wf.writeframes(int_data.tobytes())
+        
+        msg = trim_silence_pydub(filename)
+        log_callback(msg)
+
+        if info and info['status'].startswith('OK'):
+            try:
+                audio = WAVE(filename)
+                if audio.tags is None:
+                    audio.add_tags()
+                
+                audio.tags.add(TIT2(encoding=3, text=info['name']))
+                audio.tags.add(TPE1(encoding=3, text=info['artist']))
+                audio.tags.add(TALB(encoding=3, text=info['album']))
+                audio.save()
+                log_callback(f"Tagged: {os.path.basename(filename)}")
+            except Exception as e:
+                log_callback(f"Tagging failed: {e}")
+        else:
+            log_callback(f"Saved (No tags): {os.path.basename(filename)}")
     except Exception as e:
         log_callback(f"Save error: {e}")
 
 class SpotifyRecorderApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("High-Fidelity Spotify Recorder")
-        self.geometry("620x650")
+        self.title("Premium Spotify Recorder")
+        self.geometry("620x750")
         
         self.is_recording = False
+        self.is_muted = True
         self.current_spotify_info = None
         self.recording_start_info = None
         self.audio_buffer = []
         self.stream = None
         self.save_dir = ctk.StringVar(value=os.path.expanduser("~/Desktop"))
-        self.record_ch_start = ctk.IntVar(value=5) # デフォルトを 5 に設定
-        self.silent_seconds_count = 0.0
-        self.silent_warning_shown = False 
-        
+        self.record_ch_start = ctk.IntVar(value=5) 
         self.log_queue = queue.Queue()
-        self.latest_meter_val = 0.0 # ロックフリーでメーターを更新する値
-        self.audio_lock = threading.Lock()
+        self.meter_queue = queue.Queue()
         
         self.audio_devices = sd.query_devices()
         self.input_devices_info = [(i, d) for i, d in enumerate(self.audio_devices) if d['max_input_channels'] > 0]
+        self.output_devices_info = [(i, d) for i, d in enumerate(self.audio_devices) if d['max_output_channels'] > 0]
         self.input_device_strings = [f"{i}: {d['name']}" for i, d in self.input_devices_info]
+        self.output_device_strings = [f"{i}: {d['name']}" for i, d in self.output_devices_info]
 
-        # 優先デバイス（LoopbackやBlackHole）の自動検出と選択
-        preferred_id = None
-        for idx, dev in self.input_devices_info:
-            name_lower = dev['name'].lower()
-            if "loopback" in name_lower:
-                preferred_id = idx
-                break
-        if preferred_id is None:
-            for idx, dev in self.input_devices_info:
-                name_lower = dev['name'].lower()
-                if "blackhole" in name_lower:
-                    preferred_id = idx
-                    break
-
-        if preferred_id is not None:
-            self.device_in_id = preferred_id
-        else:
-            self.device_in_id = sd.default.device[0] if sd.default.device[0] is not None else 0
-
-        self.current_sample_rate = SAMPLE_RATE
-        self.update_sample_rate()
+        self.device_in_id = sd.default.device[0]
+        self.device_out_id = sd.default.device[1]
+        self._current_start_ch = 5 # コールバック用のキャッシュ
         
         self.build_ui()
         self.after(CHECK_INTERVAL, self.poll_spotify)
-        self.after(50, self.process_queues)
+        self.after(100, self.process_queues)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
-
-    def update_sample_rate(self):
-        try:
-            dev_info = sd.query_devices(self.device_in_id, 'input')
-            self.current_sample_rate = int(dev_info.get('default_samplerate', SAMPLE_RATE))
-        except Exception as e:
-            self.current_sample_rate = SAMPLE_RATE
 
     def build_ui(self):
         self.frame = ctk.CTkFrame(self, corner_radius=15)
@@ -137,10 +160,6 @@ class SpotifyRecorderApp(ctk.CTk):
         self.status_label = ctk.CTkLabel(self.frame, text="Ready to Record", font=ctk.CTkFont(size=20, weight="bold"), text_color="#1DB954")
         self.status_label.pack(pady=(15, 5))
 
-        # 無音検知アラート表示用ラベル
-        self.warning_label = ctk.CTkLabel(self.frame, text="", font=ctk.CTkFont(size=11, weight="bold"), text_color="#e91429", wraplength=550)
-        self.warning_label.pack(pady=(2, 5))
-
         info_card = ctk.CTkFrame(self.frame, fg_color="#282828", corner_radius=10)
         info_card.pack(pady=10, padx=20, fill="x")
         self.track_title_label = ctk.CTkLabel(info_card, text="Current Track: -", font=ctk.CTkFont(size=16, weight="bold"))
@@ -148,7 +167,7 @@ class SpotifyRecorderApp(ctk.CTk):
         self.artist_label = ctk.CTkLabel(info_card, text="Artist: -", font=ctk.CTkFont(size=14), text_color="#b3b3b3")
         self.artist_label.pack(pady=(0, 15))
 
-        # Audio Meter
+        # Audio Meter (無音の原因究明用)
         meter_frame = ctk.CTkFrame(self.frame, fg_color="transparent")
         meter_frame.pack(fill="x", padx=20, pady=2)
         ctk.CTkLabel(meter_frame, text="入力レベル確認:", font=ctk.CTkFont(size=11)).pack(side="left")
@@ -159,17 +178,18 @@ class SpotifyRecorderApp(ctk.CTk):
         settings_frame = ctk.CTkFrame(self.frame, fg_color="transparent")
         settings_frame.pack(pady=5, padx=20, fill="x")
 
-        # 1. 入力デバイスのみ設定 (出力機能は再生同期のカクつきをなくすため完全削除)
-        ctk.CTkLabel(settings_frame, text="Input Device", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(5, 2))
+        ctk.CTkLabel(settings_frame, text="Audio Devices", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(5, 2))
         self.in_combo = ctk.CTkOptionMenu(settings_frame, values=self.input_device_strings, command=self.on_dev_change, dropdown_font=ctk.CTkFont(size=12))
         self.in_combo.pack(fill="x", pady=2)
+        self.out_combo = ctk.CTkOptionMenu(settings_frame, values=self.output_device_strings, command=self.on_dev_change, dropdown_font=ctk.CTkFont(size=12))
+        self.out_combo.pack(fill="x", pady=2)
 
         ch_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
         ch_frame.pack(fill="x", pady=10)
         ctk.CTkLabel(ch_frame, text="録音開始ch (Start at):", font=ctk.CTkFont(size=13)).pack(side="left")
         self.ch_entry = ctk.CTkEntry(ch_frame, textvariable=self.record_ch_start, width=50)
         self.ch_entry.pack(side="left", padx=10)
-        ctk.CTkLabel(ch_frame, text="(Loopback等の設定チャンネルを指定。例: 5)", font=ctk.CTkFont(size=11), text_color="gray").pack(side="left")
+        ctk.CTkLabel(ch_frame, text="(Loopbackなら 5 など)", font=ctk.CTkFont(size=11), text_color="gray").pack(side="left")
 
         dir_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
         dir_frame.pack(fill="x", pady=5)
@@ -184,19 +204,26 @@ class SpotifyRecorderApp(ctk.CTk):
         self.stop_btn = ctk.CTkButton(ctrl_frame, text="Stop", height=50, fg_color="#e91429", hover_color="#f03e3e", state="disabled", command=self.stop_rec)
         self.stop_btn.pack(side="right", expand=True, fill="x", padx=(5, 0))
 
+        self.mon_switch = ctk.CTkSwitch(self.frame, text="モニタリング (音を聴く)", command=self.toggle_mon)
+        self.mon_switch.pack(pady=5)
+        self.mon_switch.deselect()
+
         ctk.CTkLabel(self.frame, text="Process Log", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=20)
         self.log_box = ctk.CTkTextbox(self.frame, height=100, fg_color="#121212", text_color="#1DB954")
         self.log_box.pack(pady=(0, 15), padx=20, fill="both", expand=True)
         self.log_box.configure(state="disabled")
 
+        # デフォルトデバイス名をセット
         if self.input_device_strings:
             n = next((d for d in self.input_device_strings if d.startswith(str(self.device_in_id)+":")), self.input_device_strings[0])
             self.in_combo.set(n)
+        if self.output_device_strings:
+            n = next((d for d in self.output_device_strings if d.startswith(str(self.device_out_id)+":")), self.output_device_strings[0])
+            self.out_combo.set(n)
 
     def on_dev_change(self, _):
         self.device_in_id = int(self.in_combo.get().split(":")[0])
-        self.update_sample_rate()
-        self.log_message(f"Input device changed to ID {self.device_in_id}. Detected sample rate: {self.current_sample_rate}Hz")
+        self.device_out_id = int(self.out_combo.get().split(":")[0])
 
     def log_message(self, msg):
         self.log_queue.put(msg)
@@ -211,40 +238,13 @@ class SpotifyRecorderApp(ctk.CTk):
             self.log_box.see("end")
             self.log_box.configure(state="disabled")
         
-        # ボリュームの視覚的スケーリング (ロックフリー変数から取得)
-        clamped = min(1.0, self.latest_meter_val * 2.0)
+        # ボリュームメーターの処理
+        latest_rms = 0.0
+        while not self.meter_queue.empty():
+            latest_rms = self.meter_queue.get()
+        # ボリュームの視覚的スケーリング (単純な対数的な表現に近い形)
+        clamped = min(1.0, latest_rms * 10.0) 
         self.vol_meter.set(clamped)
-
-        # 接続されているデバイス情報を検索してデバイス名を取得
-        current_dev_name = ""
-        for idx, dev in self.input_devices_info:
-            if idx == self.device_in_id:
-                current_dev_name = dev['name'].lower()
-                break
-
-        # 録音中の無音検知
-        if self.is_recording:
-            if self.latest_meter_val <= 0.0001:  # レベルがほぼ0
-                self.silent_seconds_count += 0.05
-            else:
-                self.silent_seconds_count = 0.0  # リセット
-                if self.silent_warning_shown:
-                    # 音声が戻ったら警告を解除
-                    self.silent_warning_shown = False
-                    self.warning_label.configure(text="")
-                    self.log_message("Audio signal detected. Warning cleared.")
-
-            if self.silent_seconds_count >= 3.0 and not self.silent_warning_shown:
-                self.silent_warning_shown = True
-                msg = f"【警告】入力音声レベルがゼロです。以下をご確認ください：\n1. macOSの「システム設定 > プライバシーとセキュリティ > マイク」で実行元（ターミナル等）が許可されているか\n2. Loopbackの設定で、Spotifyの音が選択した録音開始ch（現在: ch {self.record_ch_start.get()}）に正しく配線されているか"
-                self.warning_label.configure(text=msg, text_color="#e91429")
-                self.log_message("WARNING: No audio input detected. Check mic permissions or Loopback routing.")
-        else:
-            self.silent_seconds_count = 0.0
-            self.silent_warning_shown = False
-            
-            if self.warning_label.cget("text") != "" and not self.warning_label.cget("text").startswith("【警告】"):
-                self.warning_label.configure(text="")
 
         self.after(50, self.process_queues)
 
@@ -252,54 +252,52 @@ class SpotifyRecorderApp(ctk.CTk):
         d = filedialog.askdirectory(initialdir=self.save_dir.get())
         if d: self.save_dir.set(d)
 
-    def audio_callback(self, indata, frames, time_info, status):
-        # (入力専用 InputStream のコールバック)
-        if status:
-            pass # エラー状態の無視によるカクつき防止
-            
-        start_idx = self.record_ch_start.get() - 1
+    def toggle_mon(self):
+        self.is_muted = not (self.mon_switch.get() == 1)
+
+    def audio_callback(self, indata, outdata, frames, time, status):
+        start_idx = self._current_start_ch - 1
         # 入力から指定チャンネルを抜き出す
         if indata.shape[1] >= start_idx + 2:
             stereo_data = indata[:, start_idx : start_idx + 2]
         else:
             stereo_data = indata[:, :2] if indata.shape[1] >= 2 else indata
 
-        # レベルメーター用（ピーク値で軽量に計算し、ロック回避で代入）
-        if stereo_data.size > 0:
-            peak = float(np.max(np.abs(stereo_data))) / 32768.0
-            self.latest_meter_val = peak
+        # レベルメーター用にRMS値（音量）を計算してキューに送る
+        rms = np.sqrt(np.mean(stereo_data**2))
+        self.meter_queue.put(rms)
 
         # 録音中ならバッファに詰める
         if self.is_recording:
-            with self.audio_lock:
-                self.audio_buffer.append(stereo_data.copy())
+            self.audio_buffer.append(stereo_data.copy())
+        
+        # パススルー先への出力
+        if self.is_muted:
+            outdata.fill(0)
+        else:
+            out_ch = outdata.shape[1]
+            if out_ch >= 2:
+                outdata[:, :2] = stereo_data
+                if out_ch > 2: outdata[:, 2:] = 0
+            else:
+                outdata[:] = np.mean(stereo_data, axis=1, keepdims=True)
 
     def split_and_save_buffer(self, info_to_save):
-        """現在のバッファ内容を非同期で保存し、バッファを空にする"""
-        with self.audio_lock:
-            data_to_save = self.audio_buffer
-            self.audio_buffer = [] 
-            
-        if not data_to_save:
+        """現在のバッファ内容を非同期で保存し、バッファを空にするロジック（自動曲分割用）"""
+        if not self.audio_buffer:
             return
             
-        sample_rate = self.current_sample_rate
+        data = np.concatenate(self.audio_buffer, axis=0)
+        self.audio_buffer = [] # 即座にクリアして次の曲の録音に備える
         
-        def async_save():
-            try:
-                data = np.concatenate(data_to_save, axis=0)
-                if info_to_save and info_to_save['status'].startswith('OK'):
-                    name_raw = f"{info_to_save['name']} - {info_to_save['artist']}"
-                    name = "".join(x for x in name_raw if x.isalnum() or x in " -_")
-                else:
-                    name = f"Rec_{datetime.now().strftime('%H%M%S')}"
-                    
-                path = os.path.join(self.save_dir.get(), f"{name}.wav")
-                save_wav_pure(path, data, sample_rate, self.log_message)
-            except Exception as e:
-                self.log_message(f"Concatenate/Save error: {e}")
-
-        threading.Thread(target=async_save).start()
+        if info_to_save and info_to_save['status'].startswith('OK'):
+            name_raw = f"{info_to_save['name']} - {info_to_save['artist']}"
+            name = "".join(x for x in name_raw if x.isalnum() or x in " -_")
+        else:
+            name = f"Rec_{datetime.now().strftime('%H%M%S')}"
+            
+        path = os.path.join(self.save_dir.get(), f"{name}.wav")
+        threading.Thread(target=save_wav_with_tags, args=(path, data, info_to_save, self.log_message)).start()
 
     def start_rec(self):
         dev_info = sd.query_devices(self.device_in_id, 'input')
@@ -311,27 +309,21 @@ class SpotifyRecorderApp(ctk.CTk):
             return
 
         try:
-            # 検出されたサンプリングレートを使用し、blocksizeとlatencyを適切に設定して音飛びを防止
-            self.stream = sd.InputStream(
-                device=self.device_in_id,
-                samplerate=self.current_sample_rate,
-                channels=max_ch,
-                dtype='int16',  # 直接16bitの整数で受け取ることで高速化
-                blocksize=2048, # 大きめのブロックサイズでオーバーヘッドを抑制
-                latency='high', # レイテンシを高めに設定してバッファ不足（アンダーラン）を防ぐ
+            self.stream = sd.Stream(
+                device=(self.device_in_id, self.device_out_id),
+                samplerate=SAMPLE_RATE,
+                channels=(max_ch, sd.query_devices(self.device_out_id, 'output')['max_output_channels']),
+                dtype='float32',
                 callback=self.audio_callback
             )
             self.stream.start()
-            self.log_message(f"Stream started: {self.current_sample_rate}Hz, blocksize=2048, latency='high'")
         except Exception as e:
             self.log_message(f"Steam start error: {e}")
             return
 
         self.audio_buffer = []
-        self.silent_seconds_count = 0.0
-        self.silent_warning_shown = False
-        self.warning_label.configure(text="")
         self.is_recording = True
+        self._current_start_ch = self.record_ch_start.get() # ここで値を固定
         self.recording_start_info = self.current_spotify_info
         
         self.start_btn.configure(state="disabled")
@@ -360,6 +352,7 @@ class SpotifyRecorderApp(ctk.CTk):
         self.ch_entry.configure(state="normal")
         self.status_label.configure(text="Processing...", text_color="#1DB954")
         
+        # 最後に残っているバッファを保存して終了
         self.split_and_save_buffer(self.recording_start_info)
         self.recording_start_info = None
         
@@ -374,15 +367,25 @@ class SpotifyRecorderApp(ctk.CTk):
             self.track_title_label.configure(text=current_track, text_color="white")
             self.artist_label.configure(text=info['artist'], text_color="#b3b3b3")
             
+            # --- 曲の切り替わり検知ロジック (自動分割) ---
             if self.is_recording and self.recording_start_info:
                 prev_info = self.recording_start_info
                 prev_track = prev_info['name'] if prev_info['status'].startswith('OK') else None
                 
+                # 再生中で、曲名がさっきまでと変わった場合
                 if info['state'] == 'playing' and current_track != prev_track:
                     self.log_message(f"Track changed. Splitting file: {prev_track} -> {current_track}")
+                    # 前の曲を保存
                     self.split_and_save_buffer(prev_info)
+                    # 次の曲の情報に更新して録音継続
                     self.recording_start_info = info
                     self.status_label.configure(text=f"● RECORDING: {current_track}", text_color="#e91429")
+        elif info['status'] == 'PERMISSION_DENIED':
+            self.track_title_label.configure(text="Permission Required", text_color="#FFA500")
+            self.artist_label.configure(text="Check System Settings > Privacy > Automation", text_color="#FFA500")
+        elif info['status'] == 'CLOSED':
+            self.track_title_label.configure(text="Spotify Not Running", text_color="gray")
+            self.artist_label.configure(text="Please open Spotify app", text_color="gray")
         else:
             self.track_title_label.configure(text="Spotify Not Linked", text_color="gray")
             self.artist_label.configure(text="Check Permissions / Open Spotify", text_color="gray")
@@ -397,4 +400,3 @@ class SpotifyRecorderApp(ctk.CTk):
 if __name__ == "__main__":
     app = SpotifyRecorderApp()
     app.mainloop()
-
