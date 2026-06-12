@@ -1,0 +1,13 @@
+[project]
+name = "spotify-recorder"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "customtkinter>=5.2.2",
+    "mutagen>=1.47.0",
+    "numpy>=2.4.4",
+    "pydub>=0.25.1",
+    "sounddevice>=0.5.5",
+]
