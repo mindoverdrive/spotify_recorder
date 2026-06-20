@@ -108,9 +108,58 @@ def process_and_save_tracks(full_audio, history, save_dir, threshold_db, pad_sta
     log_callback(f"保存処理を開始します。総サンプル数: {len(full_audio)}")
     os.makedirs(save_dir, exist_ok=True)
     
+    # 1. 無音区間を分析して正確な分割位置を決定する
+    threshold = 10 ** (threshold_db / 20.0)
+    split_points = [0]
+    
+    for i in range(1, len(history)):
+        detect_sample = history[i]["start_sample"]
+        
+        # 過去4秒〜未来0.5秒の範囲で曲間の無音を探す
+        lookback = 4 * SAMPLE_RATE
+        lookforward = int(0.5 * SAMPLE_RATE)
+        search_start = max(0, detect_sample - lookback)
+        search_end = min(len(full_audio), detect_sample + lookforward)
+        
+        window_audio = full_audio[search_start:search_end]
+        if len(window_audio) > 0:
+            amplitude = np.max(np.abs(window_audio), axis=1)
+            is_silence = amplitude <= threshold
+            
+            diff = np.diff(is_silence.astype(int))
+            starts = np.where(diff == 1)[0] + 1
+            ends = np.where(diff == -1)[0] + 1
+            
+            if is_silence[0]:
+                starts = np.insert(starts, 0, 0)
+            if is_silence[-1]:
+                ends = np.append(ends, len(is_silence))
+                
+            if len(starts) > 0:
+                durations = ends - starts
+                # 短すぎる無音（0.05秒未満）はボーカルの息継ぎなどの可能性があるため除外
+                valid_silences = [(s, e, d) for s, e, d in zip(starts, ends, durations) if d > 0.05 * SAMPLE_RATE]
+                
+                if valid_silences:
+                    # 最も長い無音区間を曲間とみなす
+                    best_s, best_e, best_d = max(valid_silences, key=lambda x: x[2])
+                    # 無音区間の中間を正確な分割ポイントとする
+                    split_point = search_start + (best_s + best_e) // 2
+                    split_points.append(split_point)
+                    log_callback(f"無音区間から境界を補正しました: {history[i]['name']} (補正: -{(detect_sample - split_point)/SAMPLE_RATE:.2f}s)")
+                    continue
+                    
+        # ギャップレス再生などで無音が見つからない場合は、おおよそのポーリング遅延分(1.2秒)を戻す
+        fallback_split = max(0, detect_sample - int(1.2 * SAMPLE_RATE))
+        split_points.append(fallback_split)
+        log_callback(f"無音が見つからないため推測で境界を補正しました: {history[i]['name']} (補正: -1.20s)")
+        
+    split_points.append(len(full_audio))
+    
+    # 2. 補正された境界でトリミング・保存
     for i, track in enumerate(history):
-        start_sample = track["start_sample"]
-        end_sample = history[i+1]["start_sample"] if i + 1 < len(history) else len(full_audio)
+        start_sample = split_points[i]
+        end_sample = split_points[i+1]
         
         track_audio = full_audio[start_sample:end_sample]
         
@@ -171,6 +220,8 @@ class SpotifyRecorderV2App(ctk.CTk):
         self.is_recording = False
         self.is_standby = False
         self.audio_buffer = []
+        self.pre_buffer = []
+        self.pre_buffer_samples = 0
         self.recording_history = []
         self.total_samples_recorded = 0
         self.stream = None
@@ -182,7 +233,7 @@ class SpotifyRecorderV2App(ctk.CTk):
         self.meter_queue = queue.Queue()
         
         # 設定変数
-        self.save_dir = ctk.StringVar(value=os.path.expanduser("~/Desktop"))
+        self.save_dir = ctk.StringVar(value=os.path.expanduser("~/Desktop/Spotify_recodings"))
         self.record_ch_start = ctk.IntVar(value=5)
         self.silence_threshold_db = ctk.DoubleVar(value=-60.0)
         self.pad_start_sec = ctk.DoubleVar(value=0.1)
@@ -352,9 +403,14 @@ class SpotifyRecorderV2App(ctk.CTk):
         if self.is_standby:
             self.status_label.configure(text="Standby (Waiting for Spotify)", text_color="#FFA500")
             self.log_message("待機モード (Standby) を有効にしました。Spotifyの再生開始を待ちます。")
+            self.pre_buffer = []
+            self.pre_buffer_samples = 0
+            if not self.stream:
+                self.start_audio_stream()
         else:
             if not self.is_recording:
                 self.status_label.configure(text="Ready to Record", text_color="#1DB954")
+                self.stop_audio_stream()
             self.log_message("待機モードを解除しました。")
             
     def audio_callback(self, indata, outdata, frames, time, status):
@@ -373,7 +429,14 @@ class SpotifyRecorderV2App(ctk.CTk):
         if self.is_recording:
             self.audio_buffer.append(stereo_data.copy())
             self.total_samples_recorded += frames
-            
+        elif self.is_standby:
+            self.pre_buffer.append(stereo_data.copy())
+            self.pre_buffer_samples += frames
+            target_samples = 3 * SAMPLE_RATE
+            while self.pre_buffer_samples > target_samples and len(self.pre_buffer) > 1:
+                removed = self.pre_buffer.pop(0)
+                self.pre_buffer_samples -= len(removed)
+                
         # パススルー出力
         if self.is_muted.get():
             outdata.fill(0)
@@ -386,17 +449,15 @@ class SpotifyRecorderV2App(ctk.CTk):
             else:
                 outdata[:] = np.mean(stereo_data, axis=1, keepdims=True)
                 
-    def start_rec(self):
-        if self.is_recording:
-            return
-            
+    def start_audio_stream(self):
+        if self.stream:
+            return True
         dev_info = sd.query_devices(self.device_in_id, 'input')
         max_ch = dev_info['max_input_channels']
         start_ch = self.record_ch_start.get()
-        
         if start_ch + 1 > max_ch:
             self.log_message(f"Error: チャンネル {start_ch} は存在しません (最大 {max_ch}ch)")
-            return
+            return False
             
         try:
             out_dev_info = sd.query_devices(self.device_out_id, 'output')
@@ -408,15 +469,36 @@ class SpotifyRecorderV2App(ctk.CTk):
                 callback=self.audio_callback
             )
             self.stream.start()
+            self._current_start_ch = start_ch
+            return True
         except Exception as e:
-            self.log_message(f"録音開始エラー: {e}")
+            self.log_message(f"オーディオストリーム開始エラー: {e}")
+            return False
+
+    def stop_audio_stream(self):
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+
+    def start_rec(self):
+        if self.is_recording:
             return
             
+        if not self.stream:
+            if not self.start_audio_stream():
+                return
+                
         self.audio_buffer = []
+        if self.is_standby and getattr(self, 'pre_buffer', None):
+            self.audio_buffer.extend(self.pre_buffer)
+            self.total_samples_recorded = self.pre_buffer_samples
+            self.log_message(f"事前バッファ注入: 約 {self.pre_buffer_samples / SAMPLE_RATE:.2f} 秒")
+        else:
+            self.total_samples_recorded = 0
+            
         self.recording_history = []
-        self.total_samples_recorded = 0
         self.is_recording = True
-        self._current_start_ch = start_ch
         self.last_track_name = None
         
         # GUI状態切り替え
@@ -439,10 +521,10 @@ class SpotifyRecorderV2App(ctk.CTk):
                 "start_sample": 0
             })
             self.last_track_name = info["name"]
-            self.log_message(f"録音を開始しました: {info['name']} ({start_ch}-{start_ch+1}ch)")
+            self.log_message(f"録音を開始しました: {info['name']} ({self._current_start_ch}-{self._current_start_ch+1}ch)")
         else:
             self.status_label.configure(text="● RECORDING", text_color="#e91429")
-            self.log_message(f"録音を開始しました (メタデータ未検出) on ch {start_ch}-{start_ch+1}")
+            self.log_message(f"録音を開始しました (メタデータ未検出) on ch {self._current_start_ch}-{self._current_start_ch+1}")
             
     def stop_rec(self):
         if not self.is_recording:
@@ -452,10 +534,7 @@ class SpotifyRecorderV2App(ctk.CTk):
         self.is_standby = False
         self.standby_switch.deselect()
         
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+        self.stop_audio_stream()
             
         self.status_label.configure(text="Processing...", text_color="#1DB954")
         
