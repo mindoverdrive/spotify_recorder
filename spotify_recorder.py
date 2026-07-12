@@ -14,9 +14,8 @@ from spotify_recorder_services import (
     MODE_ALBUM,
     MODE_SINGLE,
     MODE_MANUAL,
-    OUTPUT_FORMATS,
-    FORMAT_WAV,
     build_diagnostic_lines,
+    format_analysis,
     get_spotify_info_extended,
     normalized_track_key,
     prepare_track_candidates,
@@ -64,10 +63,7 @@ class SpotifyRecorderApp(ctk.CTk):
         self.discard_tail = ctk.BooleanVar(value=True)
         self.auto_stop_on_idle = ctk.BooleanVar(value=True)
         self.auto_stop_grace_sec = ctk.DoubleVar(value=3.0)
-        self.normalize_audio = ctk.BooleanVar(value=True)
-
         self.record_mode = ctk.StringVar(value=MODE_ALBUM)
-        self.target_format = ctk.StringVar(value=FORMAT_WAV)
 
         self.audio_devices = sd.query_devices()
         self.input_devices = [
@@ -131,7 +127,7 @@ class SpotifyRecorderApp(ctk.CTk):
         self.level_meter.pack(side="left", fill="x", expand=True, padx=10)
         self.level_meter.set(0)
 
-        # Mode and Format selection
+        # Recording mode and fixed quality profile
         controls_frame = ctk.CTkFrame(root, fg_color="transparent")
         controls_frame.pack(fill="x", padx=18, pady=2)
         
@@ -139,9 +135,13 @@ class SpotifyRecorderApp(ctk.CTk):
         self.mode_menu = ctk.CTkSegmentedButton(controls_frame, values=MODE_PRESETS, variable=self.record_mode)
         self.mode_menu.pack(side="left", padx=10)
 
-        ctk.CTkLabel(controls_frame, text="出力形式:").pack(side="left", padx=(20,0))
-        self.format_menu = ctk.CTkOptionMenu(controls_frame, values=OUTPUT_FORMATS, variable=self.target_format, width=80)
-        self.format_menu.pack(side="left", padx=10)
+        self.quality_label = ctk.CTkLabel(
+            controls_frame,
+            text="WAV 32-bit float / Unity Gain / LUFS解析のみ",
+            fg_color="#252b33",
+            corner_radius=5,
+        )
+        self.quality_label.pack(side="left", padx=(20, 0))
 
         switches = ctk.CTkFrame(root, fg_color="transparent")
         switches.pack(fill="x", padx=18, pady=4)
@@ -166,14 +166,6 @@ class SpotifyRecorderApp(ctk.CTk):
             progress_color="#1DB954",
         )
         self.discard_tail_switch.pack(anchor="w", pady=2)
-
-        self.normalize_switch = ctk.CTkSwitch(
-            switches,
-            text="音量のノーマライズを行う (Normalize to -1dB)",
-            variable=self.normalize_audio,
-            progress_color="#1DB954",
-        )
-        self.normalize_switch.pack(anchor="w", pady=2)
 
         buttons = ctk.CTkFrame(root, fg_color="transparent")
         buttons.pack(fill="x", padx=18, pady=6)
@@ -279,9 +271,7 @@ class SpotifyRecorderApp(ctk.CTk):
         self.in_combo.configure(state=locked_state)
         self.browse_btn.configure(state=locked_state)
         self.standby_switch.configure(state=locked_state)
-        self.normalize_switch.configure(state=locked_state)
         self.mode_menu.configure(state=locked_state)
-        self.format_menu.configure(state=locked_state)
         for entry in self.setting_entries:
             entry.configure(state=locked_state)
 
@@ -344,7 +334,7 @@ class SpotifyRecorderApp(ctk.CTk):
     def run_diagnostics(self):
         self.log_message("=== 診断を実行中 ===")
         def diag_thread():
-            lines = build_diagnostic_lines()
+            lines = build_diagnostic_lines(self.sample_rate)
             for line in lines:
                 self.log_message(line)
             self.log_message("=== 診断完了 ===")
@@ -417,7 +407,14 @@ class SpotifyRecorderApp(ctk.CTk):
                 callback=self.audio_callback,
             )
             self.stream.start()
-            self.log_message(f"Audio stream started: {self.sample_rate}Hz / ch {start_ch}-{start_ch + 1}")
+            self.log_message(
+                f"Audio stream started: {self.sample_rate}Hz / ch {start_ch}-{start_ch + 1} / "
+                "Unity Gain 1.0 / WAV 32-bit float"
+            )
+            if self.sample_rate != DEFAULT_SAMPLE_RATE:
+                self.log_message(
+                    f"品質警告: 入力は{self.sample_rate}Hzです。リサンプリングせず同じレートで保存します"
+                )
             return True
         except Exception as exc:
             self.stream = None
@@ -544,8 +541,6 @@ class SpotifyRecorderApp(ctk.CTk):
             "discard_tail": bool(self.discard_tail.get()),
             "discard_tail_under_sec": float(self.discard_tail_under_sec.get()),
             "record_mode": self.record_mode.get(),
-            "target_format": self.target_format.get(),
-            "normalize": bool(self.normalize_audio.get()),
         }
         
         self.log_message(f"録音解析開始: {len(audio) / self.sample_rate:.1f}s")
@@ -564,7 +559,7 @@ class SpotifyRecorderApp(ctk.CTk):
     def show_review_ui(self, candidates, options):
         review_win = ctk.CTkToplevel(self)
         review_win.title("Review Track Candidates")
-        review_win.geometry("700x500")
+        review_win.geometry("820x560")
         review_win.transient(self)
         review_win.grab_set()
 
@@ -588,12 +583,21 @@ class SpotifyRecorderApp(ctk.CTk):
             artist = cand["track"].get("artist", "Unknown")
             dur = cand["duration"]
             reason = cand["reason"]
+            analysis = cand.get("analysis")
             
             text = f"{artist} - {title} ({dur:.1f}s)"
             if reason:
                 text += f"  [⚠ {reason}]"
+            if analysis:
+                text += f"\n{format_analysis(analysis)}"
+                if analysis["warnings"]:
+                    text += "\n⚠ " + " / ".join(analysis["warnings"])
             
-            lbl = ctk.CTkLabel(frame, text=text, text_color="white" if cand["default_checked"] else "#808995")
+            if analysis and analysis["warnings"]:
+                text_color = "#ff5964"
+            else:
+                text_color = "white" if cand["default_checked"] else "#808995"
+            lbl = ctk.CTkLabel(frame, text=text, text_color=text_color, anchor="w", justify="left")
             lbl.pack(side="left", padx=5, pady=8)
             
         def on_confirm():

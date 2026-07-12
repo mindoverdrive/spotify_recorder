@@ -1,644 +1,705 @@
 import os
-import subprocess
+import queue
 import threading
 import time
-import wave
-import queue
 from datetime import datetime
+from tkinter import filedialog
+
+import customtkinter as ctk
 import numpy as np
 import sounddevice as sd
-import customtkinter as ctk
-from tkinter import filedialog
-from mutagen.wave import WAVE
-from mutagen.id3 import TIT2, TPE1, TALB
 
-# 定数
-SAMPLE_RATE = 44100
-CHECK_INTERVAL = 1000  # Spotify監視間隔 (ms)
+from spotify_recorder_services import (
+    MODE_PRESETS,
+    MODE_ALBUM,
+    MODE_SINGLE,
+    MODE_MANUAL,
+    build_diagnostic_lines,
+    format_analysis,
+    get_spotify_info_extended,
+    normalized_track_key,
+    prepare_track_candidates,
+    process_and_save_candidates,
+)
 
-# --- 無損失（ロスレス）無音トリミング ---
-def trim_silence_lossless(audio_data, sample_rate, threshold_db=-60.0, pad_start_sec=0.1, pad_end_sec=0.3):
-    threshold = 10 ** (threshold_db / 20.0)
-    amplitude = np.max(np.abs(audio_data), axis=1)
-    non_silence_indices = np.where(amplitude > threshold)[0]
-    
-    if len(non_silence_indices) == 0:
-        return audio_data, 0, len(audio_data)
-        
-    start_idx = non_silence_indices[0]
-    end_idx = non_silence_indices[-1]
-    
-    pad_start_samples = int(pad_start_sec * sample_rate)
-    pad_end_samples = int(pad_end_sec * sample_rate)
-    
-    start_trimmed = max(0, start_idx - pad_start_samples)
-    end_trimmed = min(len(audio_data), end_idx + pad_end_samples)
-    
-    trimmed_data = audio_data[start_trimmed:end_trimmed]
-    return trimmed_data, start_trimmed, end_trimmed
+CHECK_INTERVAL_MS = 800
+DEFAULT_SAMPLE_RATE = 44100
+DEFAULT_PRE_BUFFER_SEC = 3.0
 
-# --- Spotify情報取得 (AppleScript) ---
-def get_spotify_info():
-    script = '''
-    if application "Spotify" is running then
-        tell application "Spotify"
-            if player state is playing or player state is paused then
-                set track_name to name of current track
-                set artist_name to artist of current track
-                set album_name to album of current track
-                set player_state to player state as string
-                return track_name & "||" & artist_name & "||" & album_name & "||" & player_state
-            else
-                return "IDLE"
-            end if
-        end tell
-    else
-        return "CLOSED"
-    end if
-    '''
-    try:
-        result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True, timeout=1)
-        if result.returncode == 0:
-            raw = result.stdout.strip()
-            if raw == "CLOSED":
-                return {'status': 'CLOSED'}
-            if raw == "IDLE":
-                return {'status': 'IDLE'}
-            
-            info = raw.split('||')
-            if len(info) >= 4:
-                return {
-                    'status': 'OK',
-                    'name': info[0],
-                    'artist': info[1],
-                    'album': info[2],
-                    'state': info[3]
-                }
-        else:
-            err_msg = result.stderr.strip()
-            if "not allowed" in err_msg or "許可されていません" in err_msg or "error -1743" in err_msg:
-                return {'status': 'PERMISSION_DENIED', 'error': err_msg}
-            if "error -600" in err_msg:
-                return {'status': 'CLOSED'}
-    except Exception as e:
-        return {'status': 'ERROR', 'error': str(e)}
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("green")
 
-    # フォールバック (ウィンドウタイトル)
-    fallback_script = 'tell application "System Events" to get name of first window of (first process whose name is "Spotify")'
-    try:
-        res_fb = subprocess.run(['osascript', '-e', fallback_script], capture_output=True, text=True, timeout=1)
-        if res_fb.returncode == 0:
-            title = res_fb.stdout.strip()
-            if " - " in title:
-                parts = title.split(" - ", 1)
-                return {
-                    'status': 'OK',
-                    'name': parts[1],
-                    'artist': parts[0],
-                    'album': 'Captured from Window',
-                    'state': 'playing'
-                }
-    except:
-        pass
 
-    return {'status': 'NOT_LINKED'}
-
-# --- 分割・トリミング・保存処理 (別スレッド) ---
-def process_and_save_tracks(full_audio, history, save_dir, threshold_db, pad_start, pad_end, log_callback, on_finish_callback):
-    log_callback(f"保存処理を開始します。総サンプル数: {len(full_audio)}")
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # 1. 無音区間を分析して正確な分割位置を決定する
-    threshold = 10 ** (threshold_db / 20.0)
-    split_points = [0]
-    
-    for i in range(1, len(history)):
-        detect_sample = history[i]["start_sample"]
-        
-        # 過去4秒〜未来0.5秒の範囲で曲間の無音を探す
-        lookback = 4 * SAMPLE_RATE
-        lookforward = int(0.5 * SAMPLE_RATE)
-        search_start = max(0, detect_sample - lookback)
-        search_end = min(len(full_audio), detect_sample + lookforward)
-        
-        window_audio = full_audio[search_start:search_end]
-        if len(window_audio) > 0:
-            amplitude = np.max(np.abs(window_audio), axis=1)
-            is_silence = amplitude <= threshold
-            
-            diff = np.diff(is_silence.astype(int))
-            starts = np.where(diff == 1)[0] + 1
-            ends = np.where(diff == -1)[0] + 1
-            
-            if is_silence[0]:
-                starts = np.insert(starts, 0, 0)
-            if is_silence[-1]:
-                ends = np.append(ends, len(is_silence))
-                
-            if len(starts) > 0:
-                durations = ends - starts
-                # 短すぎる無音（0.05秒未満）はボーカルの息継ぎなどの可能性があるため除外
-                valid_silences = [(s, e, d) for s, e, d in zip(starts, ends, durations) if d > 0.05 * SAMPLE_RATE]
-                
-                if valid_silences:
-                    # 最も長い無音区間を曲間とみなす
-                    best_s, best_e, best_d = max(valid_silences, key=lambda x: x[2])
-                    # 無音区間の中間を正確な分割ポイントとする
-                    split_point = search_start + (best_s + best_e) // 2
-                    split_points.append(split_point)
-                    log_callback(f"無音区間から境界を補正しました: {history[i]['name']} (補正: -{(detect_sample - split_point)/SAMPLE_RATE:.2f}s)")
-                    continue
-                    
-        # ギャップレス再生などで無音が見つからない場合は、おおよそのポーリング遅延分(1.2秒)を戻す
-        fallback_split = max(0, detect_sample - int(1.2 * SAMPLE_RATE))
-        split_points.append(fallback_split)
-        log_callback(f"無音が見つからないため推測で境界を補正しました: {history[i]['name']} (補正: -1.20s)")
-        
-    split_points.append(len(full_audio))
-    
-    # 2. 補正された境界でトリミング・保存
-    for i, track in enumerate(history):
-        start_sample = split_points[i]
-        end_sample = split_points[i+1]
-        
-        track_audio = full_audio[start_sample:end_sample]
-        
-        if len(track_audio) < SAMPLE_RATE * 5:  # 5秒未満はスキップ
-            log_callback(f"短すぎるためスキップ: {track.get('name', 'Unknown')}")
-            continue
-            
-        log_callback(f"トリミング処理中: {track['name']} - {track['artist']}")
-        trimmed, s_idx, e_idx = trim_silence_lossless(
-            track_audio, SAMPLE_RATE, threshold_db, pad_start, pad_end
-        )
-        
-        log_callback(f"トリム完了: 開始前 -{s_idx} サンプル, 終了後 -{len(track_audio) - e_idx} サンプルをカット")
-        
-        raw_name = f"{track['artist']} - {track['name']}"
-        safe_name = "".join(x for x in raw_name if x.isalnum() or x in " -_")
-        if not safe_name.strip():
-            safe_name = f"Track_{i+1}_{datetime.now().strftime('%H%M%S')}"
-            
-        file_path = os.path.join(save_dir, f"{safe_name}.wav")
-        
-        try:
-            log_callback(f"保存中: {file_path}")
-            with wave.open(file_path, 'wb') as wf:
-                wf.setnchannels(2)
-                wf.setsampwidth(2)
-                wf.setframerate(SAMPLE_RATE)
-                # float32 [-1.0, 1.0] から int16 へのロスレス変換
-                int_data = (trimmed * 32767).clip(-32768, 32767).astype(np.int16)
-                wf.writeframes(int_data.tobytes())
-                
-            # ID3タグ埋め込み
-            try:
-                audio = WAVE(file_path)
-                if audio.tags is None:
-                    audio.add_tags()
-                audio.tags.add(TIT2(encoding=3, text=track['name']))
-                audio.tags.add(TPE1(encoding=3, text=track['artist']))
-                audio.tags.add(TALB(encoding=3, text=track['album']))
-                audio.save()
-                log_callback(f"タグ埋め込み完了: {safe_name}.wav")
-            except Exception as tag_err:
-                log_callback(f"タグ埋め込み失敗: {tag_err}")
-        except Exception as save_err:
-            log_callback(f"WAV保存エラー: {save_err}")
-            
-    log_callback("すべての保存とトリミング処理が完了しました。")
-    on_finish_callback()
-
-# --- GUI アプリケーションクラス ---
-class SpotifyRecorderV2App(ctk.CTk):
+class SpotifyRecorderApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Premium Spotify Recorder V2 (Lightweight)")
-        self.geometry("640x780")
-        
-        # 録音制御変数
+        self.title("Spotify Recorder V2")
+        self.geometry("780x860")
+        self.minsize(700, 800)
+
         self.is_recording = False
         self.is_standby = False
-        self.audio_buffer = []
-        self.pre_buffer = []
-        self.pre_buffer_samples = 0
-        self.recording_history = []
-        self.total_samples_recorded = 0
         self.stream = None
+        self.audio_lock = threading.Lock()
+        self.recorded_chunks = []
+        self.pre_chunks = []
+        self.pre_samples = 0
+        self.total_samples_recorded = 0
+        self.recording_history = []
         self.current_spotify_info = None
-        self.last_track_name = None
-        
-        # キュー
+        self.last_track_key = None
+        self.spotify_idle_since = None
+        self.latest_level = 0.0
+        self._stream_start_ch = 1
+
         self.log_queue = queue.Queue()
-        self.meter_queue = queue.Queue()
-        
-        # 設定変数
         self.save_dir = ctk.StringVar(value=os.path.expanduser("~/Desktop/Spotify_recodings"))
         self.record_ch_start = ctk.IntVar(value=5)
         self.silence_threshold_db = ctk.DoubleVar(value=-60.0)
-        self.pad_start_sec = ctk.DoubleVar(value=0.1)
-        self.pad_end_sec = ctk.DoubleVar(value=0.3)
-        self.is_muted = ctk.BooleanVar(value=True)
-        
-        # デバイス一覧の取得
+        self.pad_start_sec = ctk.DoubleVar(value=0.10)
+        self.pad_end_sec = ctk.DoubleVar(value=0.35)
+        self.min_keep_sec = ctk.DoubleVar(value=12.0)
+        self.discard_tail_under_sec = ctk.DoubleVar(value=45.0)
+        self.discard_tail = ctk.BooleanVar(value=True)
+        self.auto_stop_on_idle = ctk.BooleanVar(value=True)
+        self.auto_stop_grace_sec = ctk.DoubleVar(value=3.0)
+        self.record_mode = ctk.StringVar(value=MODE_ALBUM)
+
         self.audio_devices = sd.query_devices()
-        self.input_devices_info = [(i, d) for i, d in enumerate(self.audio_devices) if d['max_input_channels'] > 0]
-        self.output_devices_info = [(i, d) for i, d in enumerate(self.audio_devices) if d['max_output_channels'] > 0]
-        self.input_device_strings = [f"{i}: {d['name']}" for i, d in self.input_devices_info]
-        self.output_device_strings = [f"{i}: {d['name']}" for i, d in self.output_devices_info]
-        
-        self.device_in_id = sd.default.device[0] if sd.default.device[0] is not None else 0
-        self.device_out_id = sd.default.device[1] if sd.default.device[1] is not None else 0
-        self._current_start_ch = 5
-        
-        # UI構築
+        self.input_devices = [
+            (index, device)
+            for index, device in enumerate(self.audio_devices)
+            if device["max_input_channels"] > 0
+        ]
+        self.input_device_strings = [f"{index}: {device['name']}" for index, device in self.input_devices]
+        self.device_in_id = self.pick_default_input()
+        self.sample_rate = DEFAULT_SAMPLE_RATE
+        self.update_sample_rate()
+
         self.build_ui()
-        
-        # 定期実行タスク
-        self.after(CHECK_INTERVAL, self.poll_spotify)
+        self.load_past_logs()
+        self.after(CHECK_INTERVAL_MS, self.poll_spotify)
         self.after(50, self.process_queues)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
+
+    def pick_default_input(self):
+        for needle in ("loopback", "blackhole"):
+            for index, device in self.input_devices:
+                if needle in device["name"].lower():
+                    return index
+        if sd.default.device[0] is not None:
+            return sd.default.device[0]
+        return self.input_devices[0][0] if self.input_devices else None
+
+    def update_sample_rate(self):
+        if self.device_in_id is None:
+            self.sample_rate = DEFAULT_SAMPLE_RATE
+            return
+        try:
+            info = sd.query_devices(self.device_in_id, "input")
+            self.sample_rate = int(info.get("default_samplerate", DEFAULT_SAMPLE_RATE))
+        except Exception:
+            self.sample_rate = DEFAULT_SAMPLE_RATE
+
     def build_ui(self):
-        # メインフレーム
-        self.frame = ctk.CTkFrame(self, corner_radius=15)
-        self.frame.pack(pady=15, padx=15, fill="both", expand=True)
-        
-        # ステータスラベル
-        self.status_label = ctk.CTkLabel(self.frame, text="Ready to Record", font=ctk.CTkFont(size=22, weight="bold"), text_color="#1DB954")
-        self.status_label.pack(pady=(20, 10))
-        
-        # 曲情報表示カード
-        info_card = ctk.CTkFrame(self.frame, fg_color="#1e1e24", corner_radius=10, border_width=1, border_color="#2a2a32")
-        info_card.pack(pady=10, padx=20, fill="x")
-        self.track_title_label = ctk.CTkLabel(info_card, text="Spotify: Not Playing", font=ctk.CTkFont(size=16, weight="bold"))
-        self.track_title_label.pack(pady=(15, 2))
-        self.artist_label = ctk.CTkLabel(info_card, text="Artist: -", font=ctk.CTkFont(size=13), text_color="#b3b3b3")
-        self.artist_label.pack(pady=(0, 15))
-        
-        # 音量レベルメーター (無負荷)
-        meter_frame = ctk.CTkFrame(self.frame, fg_color="transparent")
-        meter_frame.pack(fill="x", padx=20, pady=5)
-        ctk.CTkLabel(meter_frame, text="Level Meter:", font=ctk.CTkFont(size=12)).pack(side="left")
-        self.vol_meter = ctk.CTkProgressBar(meter_frame, height=12, fg_color="#333", progress_color="#1DB954")
-        self.vol_meter.pack(side="left", fill="x", expand=True, padx=10)
-        self.vol_meter.set(0)
-        
-        # コントロールスイッチ
-        ctrl_switch_frame = ctk.CTkFrame(self.frame, fg_color="transparent")
-        ctrl_switch_frame.pack(pady=10)
-        
-        self.standby_switch = ctk.CTkSwitch(ctrl_switch_frame, text="録音待機 (Standby Mode)", font=ctk.CTkFont(size=13, weight="bold"), progress_color="#1DB954", command=self.on_standby_toggle)
-        self.standby_switch.pack(side="left", padx=10)
-        
-        self.mute_switch = ctk.CTkSwitch(ctrl_switch_frame, text="スピーカーミュート", font=ctk.CTkFont(size=13), variable=self.is_muted)
-        self.mute_switch.pack(side="left", padx=10)
-        
-        # アクションボタン
-        btn_frame = ctk.CTkFrame(self.frame, fg_color="transparent")
-        btn_frame.pack(pady=10)
-        
-        self.start_btn = ctk.CTkButton(btn_frame, text="● Manual Start", width=140, fg_color="#1DB954", hover_color="#1ED760", text_color="#000", font=ctk.CTkFont(weight="bold"), command=self.start_rec)
-        self.start_btn.pack(side="left", padx=10)
-        
-        self.stop_btn = ctk.CTkButton(btn_frame, text="■ Stop Recording", width=140, fg_color="#e91429", hover_color="#ff2d3d", text_color="#fff", font=ctk.CTkFont(weight="bold"), command=self.stop_rec, state="disabled")
-        self.stop_btn.pack(side="left", padx=10)
-        
-        # 設定セクション (アコーディオン風)
-        settings_frame = ctk.CTkFrame(self.frame, fg_color="transparent")
-        settings_frame.pack(pady=10, padx=20, fill="x")
-        
-        ctk.CTkLabel(settings_frame, text="--- 設定項目 (Settings) ---", font=ctk.CTkFont(size=12, weight="bold"), text_color="#727272").pack(anchor="center", pady=(5, 5))
-        
-        # デバイス選択
-        dev_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
-        dev_frame.pack(fill="x", pady=2)
-        ctk.CTkLabel(dev_frame, text="入力デバイス:", width=100, anchor="w").pack(side="left")
-        self.in_combo = ctk.CTkOptionMenu(dev_frame, values=self.input_device_strings, command=self.on_dev_change)
-        self.in_combo.pack(side="left", fill="x", expand=True)
+        root = ctk.CTkFrame(self, corner_radius=12)
+        root.pack(fill="both", expand=True, padx=14, pady=14)
+
+        self.status_label = ctk.CTkLabel(
+            root,
+            text="Ready",
+            font=ctk.CTkFont(size=22, weight="bold"),
+            text_color="#1DB954",
+        )
+        self.status_label.pack(pady=(8, 4))
+
+        info = ctk.CTkFrame(root, fg_color="#1f2328", corner_radius=8)
+        info.pack(fill="x", padx=18, pady=4)
+        self.track_label = ctk.CTkLabel(info, text="Spotify: checking...", font=ctk.CTkFont(size=16, weight="bold"))
+        self.track_label.pack(pady=(8, 2))
+        self.artist_label = ctk.CTkLabel(info, text="-", text_color="#b7bec8")
+        self.artist_label.pack(pady=(0, 8))
+
+        meter_frame = ctk.CTkFrame(root, fg_color="transparent")
+        meter_frame.pack(fill="x", padx=18, pady=2)
+        ctk.CTkLabel(meter_frame, text="Input").pack(side="left")
+        self.level_meter = ctk.CTkProgressBar(meter_frame, height=12, progress_color="#1DB954")
+        self.level_meter.pack(side="left", fill="x", expand=True, padx=10)
+        self.level_meter.set(0)
+
+        # Recording mode and fixed quality profile
+        controls_frame = ctk.CTkFrame(root, fg_color="transparent")
+        controls_frame.pack(fill="x", padx=18, pady=2)
+
+        ctk.CTkLabel(controls_frame, text="モード:").pack(side="left")
+        self.mode_menu = ctk.CTkSegmentedButton(controls_frame, values=MODE_PRESETS, variable=self.record_mode)
+        self.mode_menu.pack(side="left", padx=10)
+
+        self.quality_label = ctk.CTkLabel(
+            controls_frame,
+            text="WAV 32-bit float / Unity Gain / LUFS解析のみ",
+            fg_color="#252b33",
+            corner_radius=5,
+        )
+        self.quality_label.pack(side="left", padx=(20, 0))
+
+        switches = ctk.CTkFrame(root, fg_color="transparent")
+        switches.pack(fill="x", padx=18, pady=4)
+        self.standby_switch = ctk.CTkSwitch(
+            switches,
+            text="Standby: Spotify再生で自動開始",
+            progress_color="#1DB954",
+            command=self.on_standby_toggle,
+        )
+        self.standby_switch.pack(anchor="w", pady=2)
+        self.auto_stop_switch = ctk.CTkSwitch(
+            switches,
+            text="Spotify停止/一時停止で自動停止",
+            variable=self.auto_stop_on_idle,
+            progress_color="#1DB954",
+        )
+        self.auto_stop_switch.pack(anchor="w", pady=2)
+        self.discard_tail_switch = ctk.CTkSwitch(
+            switches,
+            text="停止時の短い最終断片を保存しない",
+            variable=self.discard_tail,
+            progress_color="#1DB954",
+        )
+        self.discard_tail_switch.pack(anchor="w", pady=2)
+
+        buttons = ctk.CTkFrame(root, fg_color="transparent")
+        buttons.pack(fill="x", padx=18, pady=6)
+        self.start_btn = ctk.CTkButton(
+            buttons,
+            text="Start Recording",
+            height=40,
+            fg_color="#1DB954",
+            hover_color="#1ed760",
+            text_color="#06170c",
+            font=ctk.CTkFont(weight="bold"),
+            command=self.start_rec,
+        )
+        self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.stop_btn = ctk.CTkButton(
+            buttons,
+            text="Stop & Review",
+            height=40,
+            fg_color="#e91429",
+            hover_color="#ff3348",
+            state="disabled",
+            command=self.stop_rec,
+        )
+        self.stop_btn.pack(side="left", fill="x", expand=True, padx=6)
+        self.abort_btn = ctk.CTkButton(
+            buttons,
+            text="Abort",
+            height=40,
+            fg_color="#414852",
+            hover_color="#59616d",
+            state="disabled",
+            command=self.abort_rec,
+        )
+        self.abort_btn.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        settings = ctk.CTkScrollableFrame(root, fg_color="#161a1f", corner_radius=8, height=220)
+        settings.pack(fill="x", padx=18, pady=6)
+        settings.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(settings, text="Input Device").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 4))
+        values = self.input_device_strings if self.input_device_strings else ["No input devices"]
+        self.in_combo = ctk.CTkOptionMenu(settings, values=values, command=self.on_device_change)
+        self.in_combo.grid(row=0, column=1, sticky="ew", padx=12, pady=(12, 4))
         if self.input_device_strings:
-            self.in_combo.set(next((d for d in self.input_device_strings if d.startswith(str(self.device_in_id)+":")), self.input_device_strings[0]))
-            
-        dev_out_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
-        dev_out_frame.pack(fill="x", pady=2)
-        ctk.CTkLabel(dev_out_frame, text="パススルー出力:", width=100, anchor="w").pack(side="left")
-        self.out_combo = ctk.CTkOptionMenu(dev_out_frame, values=self.output_device_strings, command=self.on_dev_change)
-        self.out_combo.pack(side="left", fill="x", expand=True)
-        if self.output_device_strings:
-            self.out_combo.set(next((d for d in self.output_device_strings if d.startswith(str(self.device_out_id)+":")), self.output_device_strings[0]))
-            
-        # チャンネル＆保存ディレクトリ
-        ch_dir_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
-        ch_dir_frame.pack(fill="x", pady=4)
-        
-        ctk.CTkLabel(ch_dir_frame, text="開始ch (Start ch):").pack(side="left")
-        self.ch_entry = ctk.CTkEntry(ch_dir_frame, textvariable=self.record_ch_start, width=45)
-        self.ch_entry.pack(side="left", padx=5)
-        
-        ctk.CTkButton(ch_dir_frame, text="保存先選択 (Browse)", width=130, command=self.browse_dir).pack(side="right")
-        self.dir_label = ctk.CTkLabel(ch_dir_frame, textvariable=self.save_dir, anchor="w", fg_color="#2a2a32", corner_radius=5, height=28)
-        self.dir_label.pack(side="right", fill="x", expand=True, padx=5)
-        
-        # トリミング設定項目
-        trim_set_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
-        trim_set_frame.pack(fill="x", pady=5)
-        
-        # 閾値dB
-        ctk.CTkLabel(trim_set_frame, text="無音閾値 (dB):").grid(row=0, column=0, sticky="w", pady=2)
-        self.thresh_entry = ctk.CTkEntry(trim_set_frame, textvariable=self.silence_threshold_db, width=60)
-        self.thresh_entry.grid(row=0, column=1, sticky="w", padx=5)
-        ctk.CTkLabel(trim_set_frame, text="(例: -60.0)", text_color="gray").grid(row=0, column=2, sticky="w")
-        
-        # 開始マージン
-        ctk.CTkLabel(trim_set_frame, text="開始マージン (秒):").grid(row=1, column=0, sticky="w", pady=2)
-        self.margin_start_entry = ctk.CTkEntry(trim_set_frame, textvariable=self.pad_start_sec, width=60)
-        self.margin_start_entry.grid(row=1, column=1, sticky="w", padx=5)
-        ctk.CTkLabel(trim_set_frame, text="(フェードイン保護)", text_color="gray").grid(row=1, column=2, sticky="w")
-        
-        # 終了余韻マージン
-        ctk.CTkLabel(trim_set_frame, text="終了マージン (秒):").grid(row=2, column=0, sticky="w", pady=2)
-        self.margin_end_entry = ctk.CTkEntry(trim_set_frame, textvariable=self.pad_end_sec, width=60)
-        self.margin_end_entry.grid(row=2, column=1, sticky="w", padx=5)
-        ctk.CTkLabel(trim_set_frame, text="(余韻・フェードアウト保護)", text_color="gray").grid(row=2, column=2, sticky="w")
-        
-        # 実行ログ表示エリア
-        self.log_box = ctk.CTkTextbox(self.frame, font=ctk.CTkFont(family="monospace", size=11), fg_color="#0a0a0c", text_color="#00FF66", border_width=1, border_color="#2a2a32")
-        self.log_box.pack(fill="both", expand=True, padx=20, pady=(10, 15))
+            current = next(
+                (item for item in self.input_device_strings if item.startswith(f"{self.device_in_id}:")),
+                self.input_device_strings[0],
+            )
+            self.in_combo.set(current)
+
+        self.setting_entries = []
+        self.add_entry(settings, 1, "開始ch", self.record_ch_start, "Loopback等でのSpotify出力先ch")
+        self.add_entry(settings, 2, "無音閾値 dB", self.silence_threshold_db, "例: -60")
+        self.add_entry(settings, 3, "開始余白 秒", self.pad_start_sec, "フェードイン保護")
+        self.add_entry(settings, 4, "終了余白 秒", self.pad_end_sec, "余韻保護")
+        self.add_entry(settings, 5, "通常スキップ 秒", self.min_keep_sec, "これ未満の曲候補は保存しない")
+        self.add_entry(settings, 6, "最終断片 秒", self.discard_tail_under_sec, "停止時の最終曲がこれ以下なら破棄")
+        self.add_entry(settings, 7, "自動停止猶予 秒", self.auto_stop_grace_sec, "Spotify停止後に待つ秒数")
+
+        ctk.CTkLabel(settings, text="保存先").grid(row=8, column=0, sticky="w", padx=12, pady=8)
+        dir_frame = ctk.CTkFrame(settings, fg_color="transparent")
+        dir_frame.grid(row=8, column=1, sticky="ew", padx=12, pady=8)
+        dir_frame.grid_columnconfigure(0, weight=1)
+        self.dir_label = ctk.CTkLabel(dir_frame, textvariable=self.save_dir, anchor="w", fg_color="#252b33", corner_radius=5)
+        self.dir_label.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.browse_btn = ctk.CTkButton(dir_frame, text="Browse", width=78, command=self.browse_dir)
+        self.browse_btn.grid(row=0, column=1)
+
+        log_header = ctk.CTkFrame(root, fg_color="transparent")
+        log_header.pack(fill="x", padx=18, pady=(4, 2))
+        ctk.CTkLabel(log_header, text="Log", text_color="#b7bec8").pack(side="left")
+
+        diag_btn = ctk.CTkButton(log_header, text="診断(Diagnostics)を実行", height=24, width=140, command=self.run_diagnostics, fg_color="#30363d", hover_color="#484f58")
+        diag_btn.pack(side="right")
+        self.log_box = ctk.CTkTextbox(
+            root,
+            height=160,
+            font=ctk.CTkFont(family="monospace", size=11),
+            fg_color="#090c10",
+            text_color="#63f08f",
+            border_width=1,
+            border_color="#242b33",
+        )
+        self.log_box.pack(fill="both", expand=True, padx=18, pady=(0, 16))
         self.log_box.configure(state="disabled")
-        
-    def log_message(self, msg):
-        self.log_queue.put(msg)
-        
+
+        if not self.input_devices:
+            self.start_btn.configure(state="disabled")
+            self.log_message("入力デバイスが見つかりません。Loopback/BlackHole設定を確認してください。")
+
+    def add_entry(self, parent, row, label, variable, hint):
+        ctk.CTkLabel(parent, text=label).grid(row=row, column=0, sticky="w", padx=12, pady=4)
+        entry = ctk.CTkEntry(parent, textvariable=variable, width=90)
+        entry.grid(row=row, column=1, sticky="w", padx=12, pady=4)
+        ctk.CTkLabel(parent, text=hint, text_color="#808995").grid(row=row, column=1, sticky="w", padx=(116, 12), pady=4)
+        self.setting_entries.append(entry)
+
+    def set_controls_recording(self, recording):
+        self.start_btn.configure(state="disabled" if recording else "normal")
+        self.stop_btn.configure(state="normal" if recording else "disabled")
+        self.abort_btn.configure(state="normal" if recording else "disabled")
+        locked_state = "disabled" if recording else "normal"
+        self.in_combo.configure(state=locked_state)
+        self.browse_btn.configure(state=locked_state)
+        self.standby_switch.configure(state=locked_state)
+        self.mode_menu.configure(state=locked_state)
+        for entry in self.setting_entries:
+            entry.configure(state=locked_state)
+
+    def log_message(self, message):
+        self.log_queue.put(message)
+
     def process_queues(self):
-        # ログ表示の更新
         while not self.log_queue.empty():
-            m = self.log_queue.get()
+            message = self.log_queue.get()
             self.log_box.configure(state="normal")
-            ts = datetime.now().strftime("%H:%M:%S")
-            self.log_box.insert("end", f"[{ts}] {m}\n")
+            formatted_msg = f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n"
+            self.log_box.insert("end", formatted_msg)
             self.log_box.see("end")
             self.log_box.configure(state="disabled")
-            
-        # レベルメーターの更新
-        latest_rms = 0.0
-        while not self.meter_queue.empty():
-            latest_rms = self.meter_queue.get()
-        # ボリュームの視覚表現スケーリング
-        clamped = min(1.0, latest_rms * 10.0)
-        self.vol_meter.set(clamped)
-        
+            self.write_log_to_file(formatted_msg)
+
+        self.level_meter.set(min(1.0, self.latest_level * 8.0))
         self.after(50, self.process_queues)
-        
-    def on_dev_change(self, _):
-        self.device_in_id = int(self.in_combo.get().split(":")[0])
-        self.device_out_id = int(self.out_combo.get().split(":")[0])
-        
+
+    def load_past_logs(self):
+        log_dir = os.path.expanduser("~/Desktop/Spotify_recodings")
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_file_path = os.path.join(log_dir, "spotify_recorder.log")
+
+        past_log = ""
+        if os.path.exists(self.log_file_path):
+            try:
+                with open(self.log_file_path, "r", encoding="utf-8") as f:
+                    # 最後の1000行程度に制限するなどして肥大化対策（今回はシンプルに全部読み込み）
+                    past_log = f.read()
+            except Exception as e:
+                past_log = f"[System Error] 過去のログ読み込み失敗: {e}\n"
+
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", past_log)
+        self.log_box.insert("end", f"--- アプリ起動: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+        self.write_log_to_file(f"--- アプリ起動: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+
+    def write_log_to_file(self, formatted_msg):
+        try:
+            with open(self.log_file_path, "a", encoding="utf-8") as f:
+                f.write(formatted_msg)
+        except Exception:
+            pass
+
+    def on_device_change(self, _):
+        if not self.input_device_strings:
+            return
+        self.device_in_id = int(self.in_combo.get().split(":", 1)[0])
+        self.update_sample_rate()
+        self.log_message(f"入力デバイス: {self.device_in_id} / {self.sample_rate}Hz")
+
     def browse_dir(self):
-        d = filedialog.askdirectory(initialdir=self.save_dir.get())
-        if d:
-            self.save_dir.set(d)
-            
+        folder = filedialog.askdirectory(initialdir=self.save_dir.get())
+        if folder:
+            self.save_dir.set(folder)
+
+    def run_diagnostics(self):
+        self.log_message("=== 診断を実行中 ===")
+        def diag_thread():
+            lines = build_diagnostic_lines(self.sample_rate)
+            for line in lines:
+                self.log_message(line)
+            self.log_message("=== 診断完了 ===")
+        threading.Thread(target=diag_thread, daemon=True).start()
+
     def on_standby_toggle(self):
-        self.is_standby = (self.standby_switch.get() == 1)
+        self.is_standby = self.standby_switch.get() == 1
         if self.is_standby:
-            self.status_label.configure(text="Standby (Waiting for Spotify)", text_color="#FFA500")
-            self.log_message("待機モード (Standby) を有効にしました。Spotifyの再生開始を待ちます。")
-            self.pre_buffer = []
-            self.pre_buffer_samples = 0
-            if not self.stream:
-                self.start_audio_stream()
+            if self.start_audio_stream():
+                self.status_label.configure(text="Standby", text_color="#f0b429")
+                self.pre_chunks = []
+                self.pre_samples = 0
+                self.log_message("Standby有効: Spotifyの再生を待機します。")
+            else:
+                self.is_standby = False
+                self.standby_switch.deselect()
         else:
             if not self.is_recording:
-                self.status_label.configure(text="Ready to Record", text_color="#1DB954")
                 self.stop_audio_stream()
-            self.log_message("待機モードを解除しました。")
-            
-    def audio_callback(self, indata, outdata, frames, time, status):
-        start_idx = self._current_start_ch - 1
-        if indata.shape[1] >= start_idx + 2:
-            stereo_data = indata[:, start_idx : start_idx + 2]
+                self.status_label.configure(text="Ready", text_color="#1DB954")
+            self.log_message("Standby解除")
+
+    def audio_callback(self, indata, frames, time_info, status):
+        start = max(0, self._stream_start_ch - 1)
+        if indata.shape[1] >= start + 2:
+            stereo = indata[:, start : start + 2]
+        elif indata.shape[1] >= 2:
+            stereo = indata[:, :2]
         else:
-            stereo_data = indata[:, :2] if indata.shape[1] >= 2 else indata
-            if stereo_data.shape[1] < 2:
-                stereo_data = np.hstack([stereo_data, stereo_data])
-                
-        # RMSレベルメーター
-        rms = np.sqrt(np.mean(stereo_data**2))
-        self.meter_queue.put(rms)
-        
-        if self.is_recording:
-            self.audio_buffer.append(stereo_data.copy())
-            self.total_samples_recorded += frames
-        elif self.is_standby:
-            self.pre_buffer.append(stereo_data.copy())
-            self.pre_buffer_samples += frames
-            target_samples = 3 * SAMPLE_RATE
-            while self.pre_buffer_samples > target_samples and len(self.pre_buffer) > 1:
-                removed = self.pre_buffer.pop(0)
-                self.pre_buffer_samples -= len(removed)
-                
-        # パススルー出力
-        if self.is_muted.get():
-            outdata.fill(0)
-        else:
-            out_ch = outdata.shape[1]
-            if out_ch >= 2:
-                outdata[:, :2] = stereo_data
-                if out_ch > 2:
-                    outdata[:, 2:] = 0
-            else:
-                outdata[:] = np.mean(stereo_data, axis=1, keepdims=True)
-                
+            stereo = np.repeat(indata[:, :1], 2, axis=1)
+
+        self.latest_level = float(np.sqrt(np.mean(stereo * stereo))) if stereo.size else 0.0
+
+        with self.audio_lock:
+            if self.is_recording:
+                self.recorded_chunks.append(stereo.copy())
+                self.total_samples_recorded += len(stereo)
+            elif self.is_standby:
+                self.pre_chunks.append(stereo.copy())
+                self.pre_samples += len(stereo)
+                target = int(DEFAULT_PRE_BUFFER_SEC * self.sample_rate)
+                while self.pre_samples > target and len(self.pre_chunks) > 1:
+                    removed = self.pre_chunks.pop(0)
+                    self.pre_samples -= len(removed)
+
     def start_audio_stream(self):
         if self.stream:
             return True
-        dev_info = sd.query_devices(self.device_in_id, 'input')
-        max_ch = dev_info['max_input_channels']
-        start_ch = self.record_ch_start.get()
-        if start_ch + 1 > max_ch:
-            self.log_message(f"Error: チャンネル {start_ch} は存在しません (最大 {max_ch}ch)")
+        if self.device_in_id is None:
+            self.log_message("入力デバイスがありません。")
             return False
-            
+
+        self.update_sample_rate()
+        device_info = sd.query_devices(self.device_in_id, "input")
+        max_channels = int(device_info["max_input_channels"])
+        start_ch = int(self.record_ch_start.get())
+        if start_ch < 1 or start_ch + 1 > max_channels:
+            self.log_message(f"開始chエラー: ch {start_ch} は使えません (最大 {max_channels}ch)")
+            return False
+
         try:
-            out_dev_info = sd.query_devices(self.device_out_id, 'output')
-            self.stream = sd.Stream(
-                device=(self.device_in_id, self.device_out_id),
-                samplerate=SAMPLE_RATE,
-                channels=(max_ch, out_dev_info['max_output_channels']),
-                dtype='float32',
-                callback=self.audio_callback
+            self._stream_start_ch = start_ch
+            self.stream = sd.InputStream(
+                device=self.device_in_id,
+                samplerate=self.sample_rate,
+                channels=max_channels,
+                dtype="float32",
+                blocksize=2048,
+                latency="high",
+                callback=self.audio_callback,
             )
             self.stream.start()
-            self._current_start_ch = start_ch
+            self.log_message(
+                f"Audio stream started: {self.sample_rate}Hz / ch {start_ch}-{start_ch + 1} / "
+                "Unity Gain 1.0 / WAV 32-bit float"
+            )
+            if self.sample_rate != DEFAULT_SAMPLE_RATE:
+                self.log_message(
+                    f"品質警告: 入力は{self.sample_rate}Hzです。リサンプリングせず同じレートで保存します"
+                )
             return True
-        except Exception as e:
-            self.log_message(f"オーディオストリーム開始エラー: {e}")
+        except Exception as exc:
+            self.stream = None
+            self.log_message(f"Audio stream error: {exc}")
             return False
 
     def stop_audio_stream(self):
         if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+            try:
+                self.stream.stop()
+                self.stream.close()
+            finally:
+                self.stream = None
+
+    def add_history_track(self, info, start_sample):
+        if not info or info.get("status") != "OK":
+            return
+        start_sample = max(0, min(int(start_sample), int(self.total_samples_recorded)))
+        item = {
+            "name": info["name"],
+            "artist": info["artist"],
+            "album": info["album"],
+            "start_sample": start_sample,
+            "key": normalized_track_key(info),
+            "artwork_url": info.get("artwork_url")
+        }
+        self.recording_history.append(item)
+        self.last_track_key = item["key"]
+
+    def estimate_track_start_sample(self, info):
+        try:
+            position = max(0.0, float(info.get("position", 0.0)))
+        except (TypeError, ValueError):
+            position = 0.0
+        estimated = self.total_samples_recorded - int(position * self.sample_rate)
+        if self.recording_history:
+            estimated = max(estimated, int(self.recording_history[-1]["start_sample"]) + 1)
+        return max(0, min(int(estimated), int(self.total_samples_recorded)))
 
     def start_rec(self):
         if self.is_recording:
             return
-            
-        if not self.stream:
-            if not self.start_audio_stream():
-                return
-                
-        self.audio_buffer = []
-        if self.is_standby and getattr(self, 'pre_buffer', None):
-            self.audio_buffer.extend(self.pre_buffer)
-            self.total_samples_recorded = self.pre_buffer_samples
-            self.log_message(f"事前バッファ注入: 約 {self.pre_buffer_samples / SAMPLE_RATE:.2f} 秒")
-        else:
-            self.total_samples_recorded = 0
-            
+        if not self.stream and not self.start_audio_stream():
+            return
+
+        with self.audio_lock:
+            self.recorded_chunks = []
+            if self.is_standby and self.pre_chunks:
+                self.recorded_chunks.extend(chunk.copy() for chunk in self.pre_chunks)
+                self.total_samples_recorded = self.pre_samples
+                self.log_message(f"事前バッファ追加: {self.pre_samples / self.sample_rate:.2f}s")
+            else:
+                self.total_samples_recorded = 0
+            self.pre_chunks = []
+            self.pre_samples = 0
+            self.is_recording = True
+
+        self.spotify_idle_since = None
         self.recording_history = []
-        self.is_recording = True
-        self.last_track_name = None
-        
-        # GUI状態切り替え
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self.in_combo.configure(state="disabled")
-        self.out_combo.configure(state="disabled")
-        self.ch_entry.configure(state="disabled")
-        self.thresh_entry.configure(state="disabled")
-        self.margin_start_entry.configure(state="disabled")
-        self.margin_end_entry.configure(state="disabled")
-        
-        info = self.current_spotify_info
-        if info and info['status'] == 'OK':
-            self.status_label.configure(text=f"● RECORDING: {info['name']}", text_color="#e91429")
-            self.recording_history.append({
-                "name": info["name"],
-                "artist": info["artist"],
-                "album": info["album"],
-                "start_sample": 0
-            })
-            self.last_track_name = info["name"]
-            self.log_message(f"録音を開始しました: {info['name']} ({self._current_start_ch}-{self._current_start_ch+1}ch)")
+        self.last_track_key = None
+        if self.current_spotify_info and self.current_spotify_info.get("status") == "OK":
+            self.add_history_track(self.current_spotify_info, 0)
+            self.status_label.configure(
+                text=f"Recording: {self.current_spotify_info['name']}",
+                text_color="#e91429",
+            )
+            self.log_message(f"録音開始: {self.current_spotify_info['artist']} - {self.current_spotify_info['name']}")
         else:
-            self.status_label.configure(text="● RECORDING", text_color="#e91429")
-            self.log_message(f"録音を開始しました (メタデータ未検出) on ch {self._current_start_ch}-{self._current_start_ch+1}")
-            
+            self.recording_history.append(
+                {
+                    "name": datetime.now().strftime("Recording_%H%M%S"),
+                    "artist": "Unknown",
+                    "album": "Captured",
+                    "start_sample": 0,
+                    "key": None,
+                    "artwork_url": None
+                }
+            )
+            self.status_label.configure(text="Recording", text_color="#e91429")
+            self.log_message("録音開始: Spotifyメタデータ未取得")
+
+        self.set_controls_recording(True)
+
     def stop_rec(self):
         if not self.is_recording:
             return
-            
+
+        stop_info = get_spotify_info_extended()
+        if stop_info.get("status") != "OK":
+            stop_info = self.current_spotify_info
+        elif normalized_track_key(stop_info) != self.last_track_key and self.last_track_key is not None:
+            estimated_start = self.estimate_track_start_sample(stop_info)
+            self.add_history_track(stop_info, estimated_start)
+            self.log_message(
+                "停止時に未検知の曲変更を補足: "
+                f"{stop_info['artist']} - {stop_info['name']} / start {estimated_start / self.sample_rate:.2f}s"
+            )
         self.is_recording = False
         self.is_standby = False
         self.standby_switch.deselect()
-        
         self.stop_audio_stream()
-            
-        self.status_label.configure(text="Processing...", text_color="#1DB954")
-        
-        # スレッドを起動してロスレス分割とトリミングを実行
-        if self.audio_buffer:
-            full_audio = np.concatenate(self.audio_buffer, axis=0)
-            
-            # 録音開始時にトラックが記録されていなかった場合、フォールバックのトラック情報を付与
-            if not self.recording_history:
-                info = self.current_spotify_info
-                name = info['name'] if info and info['status'] == 'OK' else f"Rec_{datetime.now().strftime('%H%M%S')}"
-                artist = info['artist'] if info and info['status'] == 'OK' else "Unknown"
-                album = info['album'] if info and info['status'] == 'OK' else "Captured"
-                self.recording_history.append({
-                    "name": name,
-                    "artist": artist,
-                    "album": album,
-                    "start_sample": 0
-                })
-                
-            save_dir = self.save_dir.get()
-            threshold = self.silence_threshold_db.get()
-            pad_start = self.pad_start_sec.get()
-            pad_end = self.pad_end_sec.get()
-            
-            threading.Thread(
-                target=process_and_save_tracks,
-                args=(
-                    full_audio,
-                    list(self.recording_history),
-                    save_dir,
-                    threshold,
-                    pad_start,
-                    pad_end,
-                    self.log_message,
-                    self.on_processing_finished
-                ),
-                daemon=True
-            ).start()
-        else:
-            self.log_message("録音データがありませんでした。")
+        self.status_label.configure(text="Reviewing Candidates...", text_color="#1DB954")
+        self.stop_btn.configure(state="disabled")
+        self.abort_btn.configure(state="disabled")
+
+        with self.audio_lock:
+            chunks = list(self.recorded_chunks)
+            self.recorded_chunks = []
+
+        if not chunks:
+            self.log_message("録音データがありません。")
             self.on_processing_finished()
-            
+            return
+
+        audio = np.concatenate(chunks, axis=0)
+        options = {
+            "save_dir": self.save_dir.get(),
+            "sample_rate": self.sample_rate,
+            "threshold_db": float(self.silence_threshold_db.get()),
+            "pad_start_sec": float(self.pad_start_sec.get()),
+            "pad_end_sec": float(self.pad_end_sec.get()),
+            "min_keep_sec": float(self.min_keep_sec.get()),
+            "discard_tail": bool(self.discard_tail.get()),
+            "discard_tail_under_sec": float(self.discard_tail_under_sec.get()),
+            "record_mode": self.record_mode.get(),
+        }
+
+        self.log_message(f"録音解析開始: {len(audio) / self.sample_rate:.1f}s")
+
+        # 解析は別スレッドで行う
+        def evaluate_and_show():
+            try:
+                candidates = prepare_track_candidates(audio, list(self.recording_history), options, stop_info, self.log_message)
+                self.after(0, lambda: self.show_review_ui(candidates, options))
+            except Exception as e:
+                self.log_message(f"解析中にエラーが発生しました: {e}")
+                self.after(0, self.on_processing_finished)
+
+        threading.Thread(target=evaluate_and_show, daemon=True).start()
+
+    def show_review_ui(self, candidates, options):
+        review_win = ctk.CTkToplevel(self)
+        review_win.title("Review Track Candidates")
+        review_win.geometry("820x560")
+        review_win.transient(self)
+        review_win.grab_set()
+
+        ctk.CTkLabel(review_win, text="保存候補レビュー", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=10)
+
+        scroll = ctk.CTkScrollableFrame(review_win)
+        scroll.pack(fill="both", expand=True, padx=20, pady=10)
+
+        check_vars = []
+        for cand in candidates:
+            frame = ctk.CTkFrame(scroll)
+            frame.pack(fill="x", pady=4, padx=4)
+
+            chk_var = ctk.BooleanVar(value=cand["default_checked"])
+            check_vars.append(chk_var)
+
+            chk = ctk.CTkCheckBox(frame, text="", variable=chk_var, width=30)
+            chk.pack(side="left", padx=10)
+
+            title = cand["track"].get("name", "Unknown")
+            artist = cand["track"].get("artist", "Unknown")
+            dur = cand["duration"]
+            reason = cand["reason"]
+            analysis = cand.get("analysis")
+
+            text = f"{artist} - {title} ({dur:.1f}s)"
+            if reason:
+                text += f"  [⚠ {reason}]"
+            if analysis:
+                text += f"\n{format_analysis(analysis)}"
+                if analysis["warnings"]:
+                    text += "\n⚠ " + " / ".join(analysis["warnings"])
+
+            if analysis and analysis["warnings"]:
+                text_color = "#ff5964"
+            else:
+                text_color = "white" if cand["default_checked"] else "#808995"
+            lbl = ctk.CTkLabel(frame, text=text, text_color=text_color, anchor="w", justify="left")
+            lbl.pack(side="left", padx=5, pady=8)
+
+        def on_confirm():
+            for cand, var in zip(candidates, check_vars):
+                cand["selected"] = var.get()
+
+            review_win.destroy()
+            self.status_label.configure(text="Processing & Saving...", text_color="#1DB954")
+
+            threading.Thread(
+                target=process_and_save_candidates,
+                args=(candidates, options, self.log_message, self.on_processing_finished),
+                daemon=True,
+            ).start()
+
+        def on_cancel():
+            review_win.destroy()
+            self.abort_rec()
+
+        btn_frame = ctk.CTkFrame(review_win, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=20, pady=10)
+
+        ctk.CTkButton(btn_frame, text="Confirm & Save", fg_color="#1DB954", hover_color="#1ed760", text_color="#000", command=on_confirm).pack(side="right", padx=10)
+        ctk.CTkButton(btn_frame, text="Cancel & Discard", fg_color="#e91429", hover_color="#ff3348", command=on_cancel).pack(side="right")
+
+    def abort_rec(self):
+        if not self.is_recording:
+            return
+        self.is_recording = False
+        self.is_standby = False
+        self.standby_switch.deselect()
+        self.stop_audio_stream()
+        with self.audio_lock:
+            self.recorded_chunks = []
+            self.pre_chunks = []
+            self.pre_samples = 0
+        self.log_message("録音を破棄しました。")
+        self.on_processing_finished()
+
     def on_processing_finished(self):
-        # メインスレッドでのGUIコントロール復帰
-        def gui_update():
-            self.start_btn.configure(state="normal")
-            self.stop_btn.configure(state="disabled")
-            self.in_combo.configure(state="normal")
-            self.out_combo.configure(state="normal")
-            self.ch_entry.configure(state="normal")
-            self.thresh_entry.configure(state="normal")
-            self.margin_start_entry.configure(state="normal")
-            self.margin_end_entry.configure(state="normal")
-            self.status_label.configure(text="Ready to Record", text_color="#1DB954")
-        self.after(0, gui_update)
-        
+        def update():
+            self.set_controls_recording(False)
+            self.status_label.configure(text="Ready", text_color="#1DB954")
+
+        self.after(0, update)
+
     def poll_spotify(self):
-        info = get_spotify_info()
+        info = get_spotify_info_extended()
         self.current_spotify_info = info
-        
-        if info['status'] == 'OK':
-            current_track = info['name']
-            self.track_title_label.configure(text=current_track, text_color="white")
-            self.artist_label.configure(text=f"{info['artist']} • {info['album']}", text_color="#b3b3b3")
-            
-            # --- 自動録音待機 (Standby) ロジック ---
-            if self.is_standby and not self.is_recording:
-                if info['state'] == 'playing':
-                    self.log_message(f"Spotifyの再生を検知しました。録音を開始します: {current_track}")
-                    self.start_rec()
-            
-            # --- 曲の切り替わり検知ロジック (自動分割) ---
-            if self.is_recording and self.last_track_name:
-                if info['state'] == 'playing' and current_track != self.last_track_name:
-                    self.log_message(f"曲の切り替わりを検知しました: {self.last_track_name} -> {current_track}")
-                    # 新しい曲の開始位置（現在の録音サンプル数）を履歴に追加
-                    self.recording_history.append({
-                        "name": info["name"],
-                        "artist": info["artist"],
-                        "album": info["album"],
-                        "start_sample": self.total_samples_recorded
-                    })
-                    self.last_track_name = current_track
-                    self.status_label.configure(text=f"● RECORDING: {current_track}", text_color="#e91429")
-                    
-        elif info['status'] == 'PERMISSION_DENIED':
-            self.track_title_label.configure(text="Permission Required", text_color="#FFA500")
-            self.artist_label.configure(text="Check Settings > Privacy > Automation", text_color="#FFA500")
-        elif info['status'] == 'CLOSED':
-            self.track_title_label.configure(text="Spotify Not Running", text_color="gray")
-            self.artist_label.configure(text="Please open Spotify app", text_color="gray")
-        else:
-            self.track_title_label.configure(text="Spotify Not Linked", text_color="gray")
-            self.artist_label.configure(text="Check Permissions / Open Spotify", text_color="gray")
-            
-        self.after(CHECK_INTERVAL, self.poll_spotify)
-        
+
+        if info.get("status") == "OK":
+            self.track_label.configure(text=info["name"], text_color="white")
+            self.artist_label.configure(text=f"{info['artist']} - {info['album']} / {info['state']}", text_color="#b7bec8")
+
+            if self.is_standby and not self.is_recording and info.get("state") == "playing":
+                self.log_message(f"Spotify再生検知: {info['artist']} - {info['name']}")
+                self.start_rec()
+
+            if self.is_recording:
+                # Track change auto-stop logic for SINGLE mode
+                if self.record_mode.get() == MODE_SINGLE:
+                    if self.last_track_key and normalized_track_key(info) != self.last_track_key:
+                        self.log_message("単曲モード: 曲の切り替わりを検知し、録音を自動停止します。")
+                        self.stop_rec()
+
+            if self.is_recording and self.auto_stop_on_idle.get():
+                if info.get("state") != "playing":
+                    if self.spotify_idle_since is None:
+                        self.spotify_idle_since = time.time()
+                    elif time.time() - self.spotify_idle_since >= float(self.auto_stop_grace_sec.get()):
+                        self.log_message("Spotify自動停止検知")
+                        self.stop_rec()
+                else:
+                    self.spotify_idle_since = None
+
+            if self.is_recording and info.get("state") == "playing":
+                new_key = normalized_track_key(info)
+                if new_key and new_key != self.last_track_key:
+                    estimated_start = self.estimate_track_start_sample(info)
+                    self.add_history_track(info, estimated_start)
+                    self.log_message(f"曲変更: {info['artist']} - {info['name']}")
+
+        elif info.get("status") in ("IDLE", "CLOSED"):
+            if info.get("status") == "CLOSED":
+                self.track_label.configure(text="Spotify is closed", text_color="#b7bec8")
+            else:
+                self.track_label.configure(text="Spotify is idle", text_color="#b7bec8")
+            self.artist_label.configure(text="-", text_color="#b7bec8")
+
+            if self.is_recording and self.auto_stop_on_idle.get():
+                if self.spotify_idle_since is None:
+                    self.spotify_idle_since = time.time()
+                elif time.time() - self.spotify_idle_since >= float(self.auto_stop_grace_sec.get()):
+                    self.log_message("Spotify終了検知、録音停止")
+                    self.stop_rec()
+
+        self.after(CHECK_INTERVAL_MS, self.poll_spotify)
+
     def on_closing(self):
-        if self.is_recording:
-            # 録音中の場合は停止と保存を走らせる
-            self.stop_rec()
+        self.stop_audio_stream()
         self.destroy()
 
+
 if __name__ == "__main__":
-    app = SpotifyRecorderV2App()
+    app = SpotifyRecorderApp()
     app.mainloop()

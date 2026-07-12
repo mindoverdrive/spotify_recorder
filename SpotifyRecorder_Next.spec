@@ -1,17 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_dynamic_libs
+
+audio_binaries = collect_dynamic_libs("_soundfile_data")
 
 a = Analysis(
     ["spotify_recorder_next.py"],
     pathex=[],
-    binaries=[],
+    binaries=audio_binaries,
     datas=[
         (
             "/Users/user/Documents/Python_work/spotify_recorder/.venv/lib/python3.12/site-packages/customtkinter",
             "customtkinter/",
         )
     ],
-    hiddenimports=[],
+    hiddenimports=["soundfile", "pyloudnorm", "scipy.signal"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -50,7 +53,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="SpotifyRecorder_Next.app",
-    icon=None,
+    icon="app_icon.icns",
     bundle_identifier="local.spotify-recorder.next",
     info_plist={
         "NSMicrophoneUsageDescription": "システム音声を録音するためにマイクアクセスが必要です。",

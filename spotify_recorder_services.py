@@ -1,14 +1,15 @@
 import os
 import subprocess
 import urllib.request
-import wave
 from datetime import datetime
-import numpy as np
 
-from mutagen.id3 import TIT2, TPE1, TALB, APIC
+import numpy as np
+import pyloudnorm as pyln
+import soundfile as sf
+from scipy.signal import resample_poly
+
+from mutagen.id3 import APIC, TALB, TIT2, TPE1, TXXX
 from mutagen.wave import WAVE
-from mutagen.flac import FLAC, Picture
-from mutagen.mp4 import MP4, MP4Cover
 
 MODE_ALBUM = "Album (Auto-split)"
 MODE_SINGLE = "Single Track"
@@ -16,9 +17,10 @@ MODE_MANUAL = "Manual (No split)"
 MODE_PRESETS = [MODE_ALBUM, MODE_SINGLE, MODE_MANUAL]
 
 FORMAT_WAV = "WAV"
-FORMAT_FLAC = "FLAC"
-FORMAT_M4A = "M4A"
-OUTPUT_FORMATS = [FORMAT_WAV, FORMAT_FLAC, FORMAT_M4A]
+OUTPUT_FORMATS = [FORMAT_WAV]
+UNITY_GAIN = 1.0
+WAV_SUBTYPE = "FLOAT"
+TRUE_PEAK_OVERSAMPLE = 4
 
 
 def run_applescript(script, timeout=1.5):
@@ -32,7 +34,7 @@ def run_applescript(script, timeout=1.5):
     except Exception as exc:
         return exc
 
-def build_diagnostic_lines():
+def build_diagnostic_lines(sample_rate=None):
     lines = []
     # 1. Check Automation
     res = run_applescript('tell application "Spotify" to get player state')
@@ -76,6 +78,16 @@ def build_diagnostic_lines():
     except Exception as e:
         lines.append(f"❌ SoundDevice Error: {str(e)}")
         
+    lines.append("✅ Capture Gain: Unity Gain (1.0 / DSPなし)")
+    lines.append("✅ Output: WAV / 32-bit IEEE float")
+    lines.append("ℹ️ Spotify推奨: 音量の均一 OFF / EQ OFF / Crossfade OFF")
+    if sample_rate is not None:
+        if int(sample_rate) == 44100:
+            lines.append("✅ Sample Rate: 44100 Hz (Spotifyソースと一致)")
+        else:
+            lines.append(
+                f"⚠️ Sample Rate: {int(sample_rate)} Hz。録音中は変換せず、このレートで保存します"
+            )
     return lines
 
 def get_spotify_info_extended():
@@ -152,63 +164,151 @@ def normalized_track_key(info):
         info.get("album", "").strip().lower(),
     )
 
-def export_audio(tmp_wav_path, target_format, track_info, artwork_bytes):
-    base_path = os.path.splitext(tmp_wav_path)[0]
-    final_path = tmp_wav_path
-    
-    if target_format == FORMAT_FLAC:
-        final_path = base_path + ".flac"
-        subprocess.run(["afconvert", "-f", "flac", "-d", "flac", tmp_wav_path, final_path], check=True)
-        os.remove(tmp_wav_path)
-    elif target_format == FORMAT_M4A:
-        final_path = base_path + ".m4a"
-        subprocess.run(["afconvert", "-f", "m4af", "-d", "aac", "-b", "320000", tmp_wav_path, final_path], check=True)
-        os.remove(tmp_wav_path)
-        
+def tag_wav(wav_path, track_info, artwork_bytes, analysis):
     try:
         title = track_info.get("name", "Unknown")
         artist = track_info.get("artist", "Unknown")
         album = track_info.get("album", "Unknown")
-        
-        if target_format == FORMAT_WAV:
-            audio = WAVE(final_path)
-            if audio.tags is None:
-                audio.add_tags()
-            audio.tags.add(TIT2(encoding=3, text=title))
-            audio.tags.add(TPE1(encoding=3, text=artist))
-            audio.tags.add(TALB(encoding=3, text=album))
-            if artwork_bytes:
-                audio.tags.add(APIC(encoding=3, mime='image/jpeg', type=3, desc='Front Cover', data=artwork_bytes))
-            audio.save()
-            
-        elif target_format == FORMAT_FLAC:
-            audio = FLAC(final_path)
-            audio["title"] = title
-            audio["artist"] = artist
-            audio["album"] = album
-            if artwork_bytes:
-                pic = Picture()
-                pic.type = 3
-                pic.mime = "image/jpeg"
-                pic.desc = "Front Cover"
-                pic.data = artwork_bytes
-                audio.add_picture(pic)
-            audio.save()
-            
-        elif target_format == FORMAT_M4A:
-            audio = MP4(final_path)
-            if audio.tags is None:
-                audio.add_tags()
-            audio.tags["\xa9nam"] = title
-            audio.tags["\xa9ART"] = artist
-            audio.tags["\xa9alb"] = album
-            if artwork_bytes:
-                audio.tags["covr"] = [MP4Cover(artwork_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
-            audio.save()
+        audio = WAVE(wav_path)
+        if audio.tags is None:
+            audio.add_tags()
+        audio.tags.add(TIT2(encoding=3, text=title))
+        audio.tags.add(TPE1(encoding=3, text=artist))
+        audio.tags.add(TALB(encoding=3, text=album))
+        audio.tags.add(TXXX(encoding=3, desc="Capture Gain", text="1.0 (Unity Gain)"))
+        audio.tags.add(TXXX(encoding=3, desc="WAV Encoding", text="32-bit IEEE float"))
+        audio.tags.add(TXXX(encoding=3, desc="Sample Rate", text=str(analysis["sample_rate"])))
+        if analysis["integrated_lufs"] is not None:
+            audio.tags.add(
+                TXXX(
+                    encoding=3,
+                    desc="Integrated LUFS",
+                    text=f'{analysis["integrated_lufs"]:.2f}',
+                )
+            )
+        audio.tags.add(
+            TXXX(
+                encoding=3,
+                desc="Sample Peak dBFS",
+                text=format_db(analysis["sample_peak_dbfs"]),
+            )
+        )
+        audio.tags.add(
+            TXXX(
+                encoding=3,
+                desc="True Peak dBTP",
+                text=format_db(analysis["true_peak_dbtp"]),
+            )
+        )
+        audio.tags.add(
+            TXXX(
+                encoding=3,
+                desc="Full-scale Sample Count",
+                text=str(analysis["full_scale_sample_count"]),
+            )
+        )
+        if artwork_bytes:
+            mime = "image/png" if artwork_bytes.startswith(b"\x89PNG") else "image/jpeg"
+            audio.tags.add(
+                APIC(
+                    encoding=3,
+                    mime=mime,
+                    type=3,
+                    desc="Front Cover",
+                    data=artwork_bytes,
+                )
+            )
+        audio.save()
     except Exception as e:
         print(f"Tagging error: {e}")
-        
-    return final_path
+
+
+def dbfs(amplitude):
+    if amplitude <= 0.0:
+        return float("-inf")
+    return float(20.0 * np.log10(amplitude))
+
+
+def format_db(value):
+    return "-inf" if not np.isfinite(value) else f"{value:.2f}"
+
+
+def longest_true_run(mask):
+    longest = 0
+    current = 0
+    for value in mask:
+        if value:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
+def analyze_audio(audio, sample_rate):
+    samples = np.asarray(audio, dtype=np.float32)
+    if samples.ndim == 1:
+        samples = samples[:, np.newaxis]
+    if samples.ndim != 2 or len(samples) == 0:
+        raise ValueError("音声データが空、または不正な形状です")
+    if not np.isfinite(samples).all():
+        raise ValueError("音声データにNaNまたはInfが含まれています")
+
+    absolute = np.abs(samples)
+    sample_peak = float(np.max(absolute))
+    full_scale_mask = absolute >= 1.0
+    full_scale_frames = np.any(full_scale_mask, axis=1)
+
+    oversampled = resample_poly(
+        samples.astype(np.float64, copy=False),
+        TRUE_PEAK_OVERSAMPLE,
+        1,
+        axis=0,
+    )
+    true_peak = float(np.max(np.abs(oversampled)))
+
+    integrated_lufs = None
+    try:
+        measured = float(pyln.Meter(int(sample_rate)).integrated_loudness(samples))
+        if np.isfinite(measured):
+            integrated_lufs = measured
+    except (ValueError, ZeroDivisionError):
+        pass
+
+    sample_peak_dbfs = dbfs(sample_peak)
+    true_peak_dbtp = dbfs(true_peak)
+    warnings = []
+    if sample_peak > 1.0:
+        warnings.append("入力値が0 dBFSを超えています")
+    elif np.any(full_scale_mask):
+        warnings.append("0 dBFS到達サンプルがあります")
+    if true_peak_dbtp > 0.0:
+        warnings.append("True Peakが0 dBTPを超えています")
+
+    return {
+        "sample_rate": int(sample_rate),
+        "channels": int(samples.shape[1]),
+        "integrated_lufs": integrated_lufs,
+        "sample_peak": sample_peak,
+        "sample_peak_dbfs": sample_peak_dbfs,
+        "true_peak": true_peak,
+        "true_peak_dbtp": true_peak_dbtp,
+        "headroom_db": -sample_peak_dbfs,
+        "full_scale_sample_count": int(np.count_nonzero(full_scale_mask)),
+        "full_scale_frame_count": int(np.count_nonzero(full_scale_frames)),
+        "longest_full_scale_run": int(longest_true_run(full_scale_frames)),
+        "warnings": warnings,
+    }
+
+
+def format_analysis(analysis):
+    lufs = analysis["integrated_lufs"]
+    lufs_text = "測定不能" if lufs is None else f"{lufs:.2f} LUFS"
+    return (
+        f"{lufs_text} / Peak {format_db(analysis['sample_peak_dbfs'])} dBFS / "
+        f"True Peak {format_db(analysis['true_peak_dbtp'])} dBTP / "
+        f"Full-scale {analysis['full_scale_sample_count']} samples"
+    )
 
 def safe_filename(name):
     cleaned = "".join(ch for ch in name if ch.isalnum() or ch in " -_().[]")
@@ -370,6 +470,10 @@ def prepare_track_candidates(audio, history, options, stop_info, log_callback):
             default_checked = False
             reason = "All silence"
 
+        analysis = None
+        if len(trimmed) > 0:
+            analysis = analyze_audio(trimmed, sample_rate)
+
         candidates.append({
             "track": track,
             "start": start,
@@ -379,7 +483,8 @@ def prepare_track_candidates(audio, history, options, stop_info, log_callback):
             "duration": len(trimmed) / sample_rate if len(trimmed) > 0 else 0,
             "default_checked": default_checked,
             "reason": reason,
-            "segment_audio": segment
+            "segment_audio": segment,
+            "analysis": analysis,
         })
         
     return candidates
@@ -387,50 +492,58 @@ def prepare_track_candidates(audio, history, options, stop_info, log_callback):
 def process_and_save_candidates(candidates, options, log_callback, on_finish):
     save_dir = options["save_dir"]
     sample_rate = options["sample_rate"]
-    target_format = options.get("target_format", FORMAT_WAV)
     os.makedirs(save_dir, exist_ok=True)
-    
+
     saved = 0
-    for cand in candidates:
-        if not cand.get("selected", False):
-            continue
-            
-        track = cand["track"]
-        segment = cand["segment_audio"]
-        trim_start = cand["trim_start"]
-        trim_end = cand["trim_end"]
-        
-        trimmed = segment[trim_start:trim_end]
-        if len(trimmed) == 0:
-            continue
-            
-        if options.get("normalize", False):
-            max_val = np.max(np.abs(trimmed))
-            if max_val > 0:
-                target_peak = 10 ** (-1.0 / 20.0)  # -1.0 dBFS
-                trimmed = trimmed * (target_peak / max_val)
-            
-        filename = safe_filename(f"{track.get('artist', 'Unknown')} - {track.get('name', 'Untitled')}") + ".wav"
-        tmp_wav_path = unique_path(save_dir, filename)
-        
-        # Write WAV
-        int_data = (trimmed * 32767.0).clip(-32768, 32767).astype(np.int16)
-        with wave.open(tmp_wav_path, "wb") as wf:
-            wf.setnchannels(2)
-            wf.setsampwidth(2)
-            wf.setframerate(sample_rate)
-            wf.writeframes(int_data.tobytes())
-            
-        # Download artwork if requested
-        artwork_bytes = None
-        if track.get("artwork_url"):
-            artwork_bytes = download_url_bytes(track["artwork_url"])
-            
-        # Convert and tag
-        final_path = export_audio(tmp_wav_path, target_format, track, artwork_bytes)
-        log_callback(f"保存: {os.path.basename(final_path)}")
-        saved += 1
-        
-    log_callback(f"処理完了: {saved} 件保存しました。")
-    if on_finish:
-        on_finish()
+    failed = 0
+    try:
+        for cand in candidates:
+            if not cand.get("selected", False):
+                continue
+
+            track = cand["track"]
+            segment = cand["segment_audio"]
+            trim_start = cand["trim_start"]
+            trim_end = cand["trim_end"]
+            trimmed = np.asarray(segment[trim_start:trim_end], dtype=np.float32)
+            if len(trimmed) == 0:
+                continue
+
+            try:
+                analysis = cand.get("analysis") or analyze_audio(trimmed, sample_rate)
+                filename = (
+                    safe_filename(
+                        f"{track.get('artist', 'Unknown')} - {track.get('name', 'Untitled')}"
+                    )
+                    + ".wav"
+                )
+                final_path = unique_path(save_dir, filename)
+
+                # Unity Gain: float32 samples are written without scaling, limiting, or clipping.
+                sf.write(
+                    final_path,
+                    trimmed,
+                    int(sample_rate),
+                    format="WAV",
+                    subtype=WAV_SUBTYPE,
+                )
+
+                artwork_bytes = None
+                if track.get("artwork_url"):
+                    artwork_bytes = download_url_bytes(track["artwork_url"])
+                tag_wav(final_path, track, artwork_bytes, analysis)
+
+                log_callback(f"保存: {os.path.basename(final_path)} / {format_analysis(analysis)}")
+                for warning in analysis["warnings"]:
+                    log_callback(f"品質警告: {os.path.basename(final_path)} / {warning}")
+                saved += 1
+            except Exception as exc:
+                failed += 1
+                log_callback(
+                    f"WAV保存エラー: {track.get('artist', 'Unknown')} - "
+                    f"{track.get('name', 'Untitled')} / {exc}"
+                )
+    finally:
+        log_callback(f"処理完了: {saved} 件保存 / {failed} 件失敗")
+        if on_finish:
+            on_finish()

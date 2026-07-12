@@ -1,12 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_dynamic_libs
+
+audio_binaries = collect_dynamic_libs('_soundfile_data')
 
 a = Analysis(
     ['spotify_recorder2.py'],
     pathex=[],
-    binaries=[],
+    binaries=audio_binaries,
     datas=[('/Users/user/Documents/Python_work/spotify_recorder/.venv/lib/python3.12/site-packages/customtkinter', 'customtkinter/')],
-    hiddenimports=[],
+    hiddenimports=['soundfile', 'pyloudnorm', 'scipy.signal'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
