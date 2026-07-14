@@ -56,6 +56,7 @@ from source_providers import (
 CHECK_INTERVAL_MS = 800
 DEFAULT_SAMPLE_RATE = 44100
 DEFAULT_PRE_BUFFER_SEC = 5.0
+NETWORK_TEST_UI_TIMEOUT_MS = 45_000
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("green")
@@ -87,12 +88,15 @@ class HiResRecorderApp(ctk.CTk):
         self.spotify_quality_settings = {"available": False}
         self.last_network_test = None
         self.network_test_running = False
+        self.network_test_id = 0
+        self.network_test_watchdog_id = None
         self.capture_quality_audit = None
         self.spotify_network_monitor = None
         self.provider_adapters = create_provider_adapters()
         self.catalog_path = default_catalog_path()
 
         self.log_queue = queue.Queue()
+        self.ui_queue = queue.Queue()
         self.save_dir = ctk.StringVar(value=os.path.expanduser("~/Music/Hi-Res Recorder"))
         self.provider = ctk.StringVar(value=PROVIDER_SPOTIFY)
         self.qobuz_mode = ctk.StringVar(value=QOBUZ_OFFLINE)
@@ -410,6 +414,16 @@ class HiResRecorderApp(ctk.CTk):
         self.log_queue.put(message)
 
     def process_queues(self):
+        while not self.ui_queue.empty():
+            callback = self.ui_queue.get()
+            try:
+                callback()
+            except TclError:
+                # 終了処理中に残ったUI更新は無視する。
+                pass
+            except Exception as exc:
+                self.log_message(f"UI更新エラー: {exc}")
+
         while not self.log_queue.empty():
             message = self.log_queue.get()
             self.log_box.configure(state="normal")
@@ -693,31 +707,64 @@ class HiResRecorderApp(ctk.CTk):
             self.log_message("録音中または実測中のため、回線実測を開始できません。")
             return
         self.network_test_running = True
+        self.network_test_id += 1
+        test_id = self.network_test_id
         self.network_test_btn.configure(state="disabled", text="実測中...")
         self.log_message("Apple networkQualityで下り回線を実測します。通信量が発生します。")
 
         adapter = self.current_adapter()
+        self.network_test_watchdog_id = self.after(
+            NETWORK_TEST_UI_TIMEOUT_MS,
+            lambda: self.finish_network_preflight(
+                test_id,
+                adapter.name,
+                timeout=True,
+            ),
+        )
 
         def test_thread():
-            result = run_network_quality_test(
-                minimum_mbps=adapter.recommended_min_mbps,
-                provider_label=adapter.name,
+            try:
+                result = run_network_quality_test(
+                    minimum_mbps=adapter.recommended_min_mbps,
+                    provider_label=adapter.name,
+                )
+            except Exception as exc:
+                detail = str(exc) or type(exc).__name__
+                result = {"available": False, "error": f"回線実測スレッド失敗: {detail}"}
+            self.ui_queue.put(
+                lambda: self.finish_network_preflight(test_id, adapter.name, result=result)
             )
-            self.log_message(f"回線実測: {format_network_quality(result)}")
-            for warning in result.get("warnings", []):
-                self.log_message(f"回線警告: {warning}")
-
-            def finish_ui():
-                if self.provider.get() == adapter.name:
-                    self.last_network_test = result
-                else:
-                    self.log_message("サービス変更後に完了した回線実測結果は破棄しました。")
-                self.network_test_running = False
-                self.network_test_btn.configure(state="normal", text="回線実測")
-
-            self.after(0, finish_ui)
 
         threading.Thread(target=test_thread, daemon=True).start()
+
+    def finish_network_preflight(self, test_id, adapter_name, result=None, timeout=False):
+        if test_id != self.network_test_id or not self.network_test_running:
+            return
+
+        watchdog_id = self.network_test_watchdog_id
+        self.network_test_watchdog_id = None
+        self.network_test_running = False
+        if watchdog_id is not None:
+            try:
+                self.after_cancel(watchdog_id)
+            except TclError:
+                # 監視タイマー自身が発火中なら、取り消し対象は既に存在しない。
+                pass
+        self.network_test_btn.configure(state="normal", text="回線実測")
+
+        if timeout:
+            self.log_message(
+                "回線実測が45秒以内に完了しなかったため失敗扱いにしました。再実測できます。"
+            )
+            return
+
+        self.log_message(f"回線実測: {format_network_quality(result)}")
+        for warning in result.get("warnings", []):
+            self.log_message(f"回線警告: {warning}")
+        if self.provider.get() == adapter_name:
+            self.last_network_test = result
+        else:
+            self.log_message("サービス変更後に完了した回線実測結果は破棄しました。")
 
     def on_standby_toggle(self):
         self.is_standby = self.standby_switch.get() == 1

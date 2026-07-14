@@ -13,7 +13,9 @@ from spotify_quality_audit import (
     parse_network_quality_output,
     parse_spotify_prefs,
     read_spotify_quality_settings,
+    run_network_quality_test,
 )
+from spotify_recorder import HiResRecorderApp
 
 
 GOOD_SETTINGS = {
@@ -89,6 +91,85 @@ class NetworkQualityAuditTests(unittest.TestCase):
         self.assertTrue(result["pass"])
         self.assertEqual(result["download_mbps"], 52.0)
         self.assertEqual(result["measured_at"], 1234.0)
+
+    @patch("spotify_quality_audit.subprocess.run", side_effect=UnicodeDecodeError("utf-8", b"\\xff", 0, 1, "invalid"))
+    @patch("spotify_quality_audit.shutil.which", return_value="/usr/bin/networkQuality")
+    def test_runner_exception_is_reported_as_a_failed_measurement(self, _which, _run):
+        result = run_network_quality_test()
+
+        self.assertFalse(result["available"])
+        self.assertIn("networkQuality実行失敗", result["error"])
+
+
+class NetworkPreflightUiTests(unittest.TestCase):
+    def setUp(self):
+        self.app = _NetworkPreflightApp()
+
+    def test_timeout_always_reenables_the_measurement_button(self):
+        HiResRecorderApp.finish_network_preflight(
+            self.app,
+            test_id=1,
+            adapter_name="Spotify",
+            timeout=True,
+        )
+
+        self.assertFalse(self.app.network_test_running)
+        self.assertEqual(self.app.network_test_btn.options, {"state": "normal", "text": "回線実測"})
+        self.assertTrue(any("45秒" in message for message in self.app.logs))
+
+    def test_completed_measurement_is_saved_for_the_active_provider(self):
+        result = {
+            "available": True,
+            "pass": True,
+            "warnings": [],
+            "download_mbps": 52.0,
+            "base_rtt_ms": 19.2,
+            "minimum_mbps": 2.0,
+        }
+
+        HiResRecorderApp.finish_network_preflight(
+            self.app,
+            test_id=1,
+            adapter_name="Spotify",
+            result=result,
+        )
+
+        self.assertIs(self.app.last_network_test, result)
+        self.assertFalse(self.app.network_test_running)
+
+
+class _NetworkPreflightApp:
+    def __init__(self):
+        self.network_test_id = 1
+        self.network_test_running = True
+        self.network_test_watchdog_id = "watchdog"
+        self.network_test_btn = _Button()
+        self.provider = _Value("Spotify")
+        self.last_network_test = None
+        self.logs = []
+        self.cancelled_watchdogs = []
+
+    def after_cancel(self, timer_id):
+        self.cancelled_watchdogs.append(timer_id)
+
+    def log_message(self, message):
+        self.logs.append(message)
+
+
+class _Button:
+    def __init__(self):
+        self.options = {}
+
+    def configure(self, **options):
+        self.options.update(options)
+
+
+class _Value:
+    def __init__(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
 
 
 class CaptureAuditTests(unittest.TestCase):

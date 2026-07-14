@@ -171,14 +171,21 @@ def run_network_quality_test(
     if not executable:
         return {"available": False, "error": "networkQualityコマンドがありません"}
     try:
+        runtime_seconds = max(1, int(max_runtime))
+    except (TypeError, ValueError) as exc:
+        return {"available": False, "error": f"回線実測時間が不正です: {exc}"}
+
+    try:
         result = subprocess.run(
-            [executable, "-c", "-u", "-M", str(int(max_runtime))],
+            [executable, "-c", "-u", "-M", str(runtime_seconds)],
             capture_output=True,
             text=True,
-            timeout=max_runtime + 15,
+            timeout=runtime_seconds + 15,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return {"available": False, "error": str(exc)}
+    except Exception as exc:
+        # networkQualityの出力デコード失敗なども、UIを待機状態のままにしない。
+        detail = str(exc) or type(exc).__name__
+        return {"available": False, "error": f"networkQuality実行失敗: {detail}"}
     if result.returncode != 0:
         return {
             "available": False,
