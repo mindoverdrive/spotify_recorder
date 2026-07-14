@@ -5,7 +5,7 @@ from PyInstaller.utils.hooks import collect_dynamic_libs
 audio_binaries = collect_dynamic_libs('_soundfile_data')
 
 a = Analysis(
-    ['spotify_recorder2.py'],
+    ['spotify_recorder.py'],
     pathex=[],
     binaries=audio_binaries,
     datas=[('/Users/user/Documents/Python_work/spotify_recorder/.venv/lib/python3.12/site-packages/customtkinter', 'customtkinter/')],
@@ -48,8 +48,9 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='SpotifyRecorder_Native.app',
-    icon=None,
-    bundle_identifier=None,
+    version='3.0.0',
+    icon='app_icon.icns',
+    bundle_identifier='local.spotify-recorder.native',
     info_plist={
         'NSMicrophoneUsageDescription': 'システム音声を録音するためにマイクアクセスが必要です。',
         'NSAppleEventsUsageDescription': 'Spotifyの再生情報を取得するためにアクセスが必要です。',

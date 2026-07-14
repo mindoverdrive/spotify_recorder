@@ -11,6 +11,14 @@ from scipy.signal import resample_poly
 from mutagen.id3 import APIC, TALB, TIT2, TPE1, TXXX
 from mutagen.wave import WAVE
 
+from recording_catalog import record_saved_recording
+from spotify_quality_audit import (
+    audit_for_audio_range,
+    evaluate_spotify_quality_settings,
+    format_timecode,
+    read_spotify_quality_settings,
+)
+
 MODE_ALBUM = "Album (Auto-split)"
 MODE_SINGLE = "Single Track"
 MODE_MANUAL = "Manual (No split)"
@@ -80,7 +88,17 @@ def build_diagnostic_lines(sample_rate=None):
         
     lines.append("✅ Capture Gain: Unity Gain (1.0 / DSPなし)")
     lines.append("✅ Output: WAV / 32-bit IEEE float")
-    lines.append("ℹ️ Spotify推奨: 音量の均一 OFF / EQ OFF / Crossfade OFF")
+    settings = read_spotify_quality_settings()
+    settings_evaluation = evaluate_spotify_quality_settings(settings)
+    if settings_evaluation["conditions_pass"]:
+        lines.append(
+            "✅ Spotify設定証跡: Lossless候補 / 音質自動低下OFF / 音量均一OFF / Automix OFF"
+        )
+    else:
+        for warning in settings_evaluation["warnings"]:
+            lines.append(f"⚠️ Spotify設定証跡: {warning}")
+    lines.append("ℹ️ 実効コーデックはSpotify公開APIから取得できないため、Lossless断定はできません")
+    lines.append("ℹ️ Spotify推奨: EQ OFF / Crossfade OFF / 可能ならLosslessダウンロード後にOffline再生")
     if sample_rate is not None:
         if int(sample_rate) == 44100:
             lines.append("✅ Sample Rate: 44100 Hz (Spotifyソースと一致)")
@@ -164,7 +182,7 @@ def normalized_track_key(info):
         info.get("album", "").strip().lower(),
     )
 
-def tag_wav(wav_path, track_info, artwork_bytes, analysis):
+def tag_wav(wav_path, track_info, artwork_bytes, analysis, capture_audit=None):
     try:
         title = track_info.get("name", "Unknown")
         artist = track_info.get("artist", "Unknown")
@@ -207,6 +225,146 @@ def tag_wav(wav_path, track_info, artwork_bytes, analysis):
                 text=str(analysis["full_scale_sample_count"]),
             )
         )
+        suspect_locations = format_analysis_suspect_locations(analysis)
+        if suspect_locations:
+            audio.tags.add(
+                TXXX(
+                    encoding=3,
+                    desc="Audio Suspect Locations",
+                    text=" / ".join(suspect_locations),
+                )
+            )
+        if capture_audit:
+            settings = capture_audit.get("spotify_settings") or {}
+            network_test = capture_audit.get("network_test") or {}
+            network = capture_audit.get("network_observation") or {}
+            audio.tags.add(
+                TXXX(
+                    encoding=3,
+                    desc="Capture Assurance",
+                    text=capture_audit.get("assurance_label", "Unknown"),
+                )
+            )
+            audio.tags.add(
+                TXXX(
+                    encoding=3,
+                    desc="Lossless Verified",
+                    text="No - Spotify does not expose the effective playback codec",
+                )
+            )
+            audio.tags.add(
+                TXXX(
+                    encoding=3,
+                    desc="Spotify Quality Setting Raw",
+                    text=str(settings.get("streaming_quality_raw", "Unknown")),
+                )
+            )
+            audio.tags.add(
+                TXXX(
+                    encoding=3,
+                    desc="Spotify Auto Downgrade",
+                    text=(
+                        "Disabled"
+                        if settings.get("auto_downgrade") is False
+                        else "Not verified"
+                    ),
+                )
+            )
+            audio.tags.add(
+                TXXX(
+                    encoding=3,
+                    desc="Audio Callback Anomalies",
+                    text=str(capture_audit.get("callback_status_count", 0)),
+                )
+            )
+            audio.tags.add(
+                TXXX(
+                    encoding=3,
+                    desc="Playback Stall Suspicions",
+                    text=(
+                        f'{capture_audit.get("playback_stall_count", 0)} events / '
+                        f'{capture_audit.get("playback_stall_sec", 0.0):.3f} sec'
+                    ),
+                )
+            )
+            audio.tags.add(
+                TXXX(
+                    encoding=3,
+                    desc="Timeline Slip Suspicions",
+                    text=(
+                        f'{capture_audit.get("timeline_slip_count", 0)} events / '
+                        f'max {capture_audit.get("max_timeline_slip_sec", 0.0):.3f} sec'
+                    ),
+                )
+            )
+            audio.tags.add(
+                TXXX(
+                    encoding=3,
+                    desc="Digital Silence Suspicions",
+                    text=(
+                        f'{capture_audit.get("digital_zero_run_count", 0)} events / '
+                        f'max {capture_audit.get("longest_digital_zero_sec", 0.0):.3f} sec'
+                    ),
+                )
+            )
+            audio.tags.add(
+                TXXX(
+                    encoding=3,
+                    desc="Audio Block Repeats",
+                    text=str(capture_audit.get("repeated_audio_blocks", 0)),
+                )
+            )
+            audio.tags.add(
+                TXXX(
+                    encoding=3,
+                    desc="Callback Boundary Discontinuities",
+                    text=str(capture_audit.get("boundary_discontinuities", 0)),
+                )
+            )
+            if network_test.get("available"):
+                audio.tags.add(
+                    TXXX(
+                        encoding=3,
+                        desc="Network Preflight Mbps",
+                        text=f'{network_test.get("download_mbps", 0.0):.2f}',
+                    )
+                )
+            if network.get("sample_count"):
+                audio.tags.add(
+                    TXXX(
+                        encoding=3,
+                        desc="Spotify Network Observed Bytes",
+                        text=str(network.get("inbound_total_bytes", 0)),
+                    )
+                )
+                audio.tags.add(
+                    TXXX(
+                        encoding=3,
+                        desc="Spotify Network Average kbps",
+                        text=f'{network.get("inbound_average_kbps", 0.0):.2f}',
+                    )
+                )
+            if capture_audit.get("warnings"):
+                audio.tags.add(
+                    TXXX(
+                        encoding=3,
+                        desc="Capture Audit Warnings",
+                        text=" / ".join(capture_audit["warnings"]),
+                    )
+                )
+            capture_locations = [
+                f"{format_timecode(event.get('time_sec', 0.0))}: "
+                f"{event.get('detail', event.get('type', '異常疑い'))}"
+                for event in capture_audit.get("events", [])[:20]
+            ]
+            if capture_locations:
+                audio.tags.add(
+                    TXXX(
+                        encoding=3,
+                        desc="Capture Suspect Locations",
+                        text=" / ".join(capture_locations),
+                    )
+                )
         if artwork_bytes:
             mime = "image/png" if artwork_bytes.startswith(b"\x89PNG") else "image/jpeg"
             audio.tags.add(
@@ -245,6 +403,20 @@ def longest_true_run(mask):
     return longest
 
 
+def true_ranges(mask, limit=20):
+    values = np.asarray(mask, dtype=bool)
+    if values.size == 0:
+        return []
+    changes = np.diff(values.astype(np.int8))
+    starts = list(np.where(changes == 1)[0] + 1)
+    ends = list(np.where(changes == -1)[0] + 1)
+    if values[0]:
+        starts.insert(0, 0)
+    if values[-1]:
+        ends.append(len(values))
+    return list(zip(starts, ends))[: int(limit)]
+
+
 def analyze_audio(audio, sample_rate):
     samples = np.asarray(audio, dtype=np.float32)
     if samples.ndim == 1:
@@ -256,6 +428,8 @@ def analyze_audio(audio, sample_rate):
 
     absolute = np.abs(samples)
     sample_peak = float(np.max(absolute))
+    sample_peak_flat_index = int(np.argmax(absolute))
+    sample_peak_frame = sample_peak_flat_index // samples.shape[1]
     full_scale_mask = absolute >= 1.0
     full_scale_frames = np.any(full_scale_mask, axis=1)
 
@@ -266,6 +440,8 @@ def analyze_audio(audio, sample_rate):
         axis=0,
     )
     true_peak = float(np.max(np.abs(oversampled)))
+    true_peak_flat_index = int(np.argmax(np.abs(oversampled)))
+    true_peak_frame = true_peak_flat_index // samples.shape[1]
 
     integrated_lufs = None
     try:
@@ -291,12 +467,24 @@ def analyze_audio(audio, sample_rate):
         "integrated_lufs": integrated_lufs,
         "sample_peak": sample_peak,
         "sample_peak_dbfs": sample_peak_dbfs,
+        "sample_peak_frame": sample_peak_frame,
+        "sample_peak_time_sec": sample_peak_frame / sample_rate,
         "true_peak": true_peak,
         "true_peak_dbtp": true_peak_dbtp,
+        "true_peak_time_sec": true_peak_frame / (sample_rate * TRUE_PEAK_OVERSAMPLE),
         "headroom_db": -sample_peak_dbfs,
         "full_scale_sample_count": int(np.count_nonzero(full_scale_mask)),
         "full_scale_frame_count": int(np.count_nonzero(full_scale_frames)),
         "longest_full_scale_run": int(longest_true_run(full_scale_frames)),
+        "full_scale_ranges": [
+            {
+                "start_frame": int(start),
+                "end_frame": int(end),
+                "start_sec": start / sample_rate,
+                "end_sec": end / sample_rate,
+            }
+            for start, end in true_ranges(full_scale_frames)
+        ],
         "warnings": warnings,
     }
 
@@ -309,6 +497,23 @@ def format_analysis(analysis):
         f"True Peak {format_db(analysis['true_peak_dbtp'])} dBTP / "
         f"Full-scale {analysis['full_scale_sample_count']} samples"
     )
+
+
+def format_analysis_suspect_locations(analysis, limit=8):
+    locations = []
+    for item in analysis.get("full_scale_ranges", [])[: int(limit)]:
+        start = format_timecode(item["start_sec"])
+        end = format_timecode(item["end_sec"])
+        if item["end_sec"] - item["start_sec"] <= 0.01:
+            locations.append(f"{start}: 0 dBFS到達")
+        else:
+            locations.append(f"{start}-{end}: 連続フルスケール")
+    if analysis.get("true_peak_dbtp", float("-inf")) > 0.0:
+        locations.append(
+            f"{format_timecode(analysis.get('true_peak_time_sec', 0.0))}: "
+            f"True Peak {format_db(analysis['true_peak_dbtp'])} dBTP"
+        )
+    return locations[: int(limit)]
 
 def safe_filename(name):
     cleaned = "".join(ch for ch in name if ch.isalnum() or ch in " -_().[]")
@@ -492,6 +697,8 @@ def prepare_track_candidates(audio, history, options, stop_info, log_callback):
 def process_and_save_candidates(candidates, options, log_callback, on_finish):
     save_dir = options["save_dir"]
     sample_rate = options["sample_rate"]
+    capture_audit = options.get("capture_audit")
+    catalog_path = options.get("catalog_path")
     os.makedirs(save_dir, exist_ok=True)
 
     saved = 0
@@ -511,6 +718,12 @@ def process_and_save_candidates(candidates, options, log_callback, on_finish):
 
             try:
                 analysis = cand.get("analysis") or analyze_audio(trimmed, sample_rate)
+                candidate_start = int(cand.get("start", 0))
+                file_audit = audit_for_audio_range(
+                    capture_audit,
+                    candidate_start + int(trim_start),
+                    candidate_start + int(trim_end),
+                )
                 filename = (
                     safe_filename(
                         f"{track.get('artist', 'Unknown')} - {track.get('name', 'Untitled')}"
@@ -531,7 +744,23 @@ def process_and_save_candidates(candidates, options, log_callback, on_finish):
                 artwork_bytes = None
                 if track.get("artwork_url"):
                     artwork_bytes = download_url_bytes(track["artwork_url"])
-                tag_wav(final_path, track, artwork_bytes, analysis)
+                tag_wav(final_path, track, artwork_bytes, analysis, file_audit)
+
+                if catalog_path:
+                    try:
+                        catalog_analysis = dict(analysis)
+                        catalog_analysis["duration_sec"] = len(trimmed) / sample_rate
+                        record_saved_recording(
+                            final_path,
+                            track,
+                            catalog_analysis,
+                            file_audit,
+                            catalog_path,
+                        )
+                    except Exception as exc:
+                        log_callback(
+                            f"録音履歴エラー: {os.path.basename(final_path)} / {exc}"
+                        )
 
                 log_callback(f"保存: {os.path.basename(final_path)} / {format_analysis(analysis)}")
                 for warning in analysis["warnings"]:

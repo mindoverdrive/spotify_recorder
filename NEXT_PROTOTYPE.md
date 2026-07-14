@@ -1,5 +1,7 @@
 # Spotify Recorder Next Prototype
 
+> 状態: 実験版です。通常利用と高音質監査には`SpotifyRecorder_Native.app`を使用します。
+
 ## 目的
 
 既存アプリとは別に、停止時にできる「次曲の頭だけ録音された短いファイル」を保存前に自動スキップする試作用アプリです。

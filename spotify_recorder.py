@@ -1,5 +1,6 @@
 import os
 import queue
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -9,6 +10,7 @@ import customtkinter as ctk
 import numpy as np
 import sounddevice as sd
 
+from recording_catalog import default_catalog_path, list_recordings
 from spotify_recorder_services import (
     MODE_PRESETS,
     MODE_ALBUM,
@@ -16,10 +18,23 @@ from spotify_recorder_services import (
     MODE_MANUAL,
     build_diagnostic_lines,
     format_analysis,
+    format_analysis_suspect_locations,
     get_spotify_info_extended,
     normalized_track_key,
     prepare_track_candidates,
     process_and_save_candidates,
+)
+from spotify_quality_audit import (
+    CaptureQualityAudit,
+    SpotifyNetworkMonitor,
+    evaluate_spotify_quality_settings,
+    format_audit_events,
+    format_capture_audit,
+    format_network_quality,
+    format_spotify_quality_settings,
+    format_timecode,
+    read_spotify_quality_settings,
+    run_network_quality_test,
 )
 
 CHECK_INTERVAL_MS = 800
@@ -33,7 +48,7 @@ ctk.set_default_color_theme("green")
 class SpotifyRecorderApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Spotify Recorder V2")
+        self.title("Spotify Recorder Native")
         self.geometry("780x860")
         self.minsize(700, 800)
 
@@ -51,6 +66,12 @@ class SpotifyRecorderApp(ctk.CTk):
         self.spotify_idle_since = None
         self.latest_level = 0.0
         self._stream_start_ch = 1
+        self.spotify_quality_settings = {"available": False}
+        self.last_network_test = None
+        self.network_test_running = False
+        self.capture_quality_audit = None
+        self.spotify_network_monitor = None
+        self.catalog_path = default_catalog_path()
 
         self.log_queue = queue.Queue()
         self.save_dir = ctk.StringVar(value=os.path.expanduser("~/Desktop/Spotify_recodings"))
@@ -78,6 +99,7 @@ class SpotifyRecorderApp(ctk.CTk):
 
         self.build_ui()
         self.load_past_logs()
+        self.refresh_source_quality_status(log_result=True)
         self.after(CHECK_INTERVAL_MS, self.poll_spotify)
         self.after(50, self.process_queues)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -118,7 +140,14 @@ class SpotifyRecorderApp(ctk.CTk):
         self.track_label = ctk.CTkLabel(info, text="Spotify: checking...", font=ctk.CTkFont(size=16, weight="bold"))
         self.track_label.pack(pady=(8, 2))
         self.artist_label = ctk.CTkLabel(info, text="-", text_color="#b7bec8")
-        self.artist_label.pack(pady=(0, 8))
+        self.artist_label.pack(pady=(0, 2))
+        self.source_quality_label = ctk.CTkLabel(
+            info,
+            text="ソース品質: 未監査",
+            text_color="#f0b429",
+            wraplength=720,
+        )
+        self.source_quality_label.pack(pady=(0, 8), padx=10)
 
         meter_frame = ctk.CTkFrame(root, fg_color="transparent")
         meter_frame.pack(fill="x", padx=18, pady=2)
@@ -237,9 +266,37 @@ class SpotifyRecorderApp(ctk.CTk):
         log_header = ctk.CTkFrame(root, fg_color="transparent")
         log_header.pack(fill="x", padx=18, pady=(4, 2))
         ctk.CTkLabel(log_header, text="Log", text_color="#b7bec8").pack(side="left")
+        self.history_btn = ctk.CTkButton(
+            log_header,
+            text="録音履歴",
+            height=24,
+            width=82,
+            command=self.show_recording_history,
+            fg_color="#30363d",
+            hover_color="#484f58",
+        )
+        self.history_btn.pack(side="left", padx=(8, 0))
         
-        diag_btn = ctk.CTkButton(log_header, text="診断(Diagnostics)を実行", height=24, width=140, command=self.run_diagnostics, fg_color="#30363d", hover_color="#484f58")
-        diag_btn.pack(side="right")
+        self.network_test_btn = ctk.CTkButton(
+            log_header,
+            text="回線実測",
+            height=24,
+            width=82,
+            command=self.run_network_preflight,
+            fg_color="#30363d",
+            hover_color="#484f58",
+        )
+        self.network_test_btn.pack(side="right")
+        self.diag_btn = ctk.CTkButton(
+            log_header,
+            text="品質診断",
+            height=24,
+            width=92,
+            command=self.run_diagnostics,
+            fg_color="#30363d",
+            hover_color="#484f58",
+        )
+        self.diag_btn.pack(side="right", padx=(0, 6))
         self.log_box = ctk.CTkTextbox(
             root,
             height=160,
@@ -272,6 +329,10 @@ class SpotifyRecorderApp(ctk.CTk):
         self.browse_btn.configure(state=locked_state)
         self.standby_switch.configure(state=locked_state)
         self.mode_menu.configure(state=locked_state)
+        self.diag_btn.configure(state=locked_state)
+        self.network_test_btn.configure(
+            state="disabled" if recording or self.network_test_running else "normal"
+        )
         for entry in self.setting_entries:
             entry.configure(state=locked_state)
 
@@ -337,8 +398,45 @@ class SpotifyRecorderApp(ctk.CTk):
             lines = build_diagnostic_lines(self.sample_rate)
             for line in lines:
                 self.log_message(line)
+            self.after(0, self.refresh_source_quality_status)
             self.log_message("=== 診断完了 ===")
         threading.Thread(target=diag_thread, daemon=True).start()
+
+    def refresh_source_quality_status(self, log_result=False):
+        self.spotify_quality_settings = read_spotify_quality_settings()
+        evaluation = evaluate_spotify_quality_settings(self.spotify_quality_settings)
+        self.source_quality_label.configure(
+            text=f"ソース品質: {evaluation['label']}",
+            text_color="#63f08f" if evaluation["conditions_pass"] else "#f0b429",
+        )
+        if log_result:
+            self.log_message(
+                f"Spotify設定監査: {format_spotify_quality_settings(self.spotify_quality_settings)}"
+            )
+        return self.spotify_quality_settings
+
+    def run_network_preflight(self):
+        if self.is_recording or self.network_test_running:
+            self.log_message("録音中または実測中のため、回線実測を開始できません。")
+            return
+        self.network_test_running = True
+        self.network_test_btn.configure(state="disabled", text="実測中...")
+        self.log_message("Apple networkQualityで下り回線を実測します。通信量が発生します。")
+
+        def test_thread():
+            result = run_network_quality_test()
+            self.last_network_test = result
+            self.log_message(f"回線実測: {format_network_quality(result)}")
+            for warning in result.get("warnings", []):
+                self.log_message(f"回線警告: {warning}")
+
+            def finish_ui():
+                self.network_test_running = False
+                self.network_test_btn.configure(state="normal", text="回線実測")
+
+            self.after(0, finish_ui)
+
+        threading.Thread(target=test_thread, daemon=True).start()
 
     def on_standby_toggle(self):
         self.is_standby = self.standby_switch.get() == 1
@@ -367,6 +465,9 @@ class SpotifyRecorderApp(ctk.CTk):
             stereo = np.repeat(indata[:, :1], 2, axis=1)
 
         self.latest_level = float(np.sqrt(np.mean(stereo * stereo))) if stereo.size else 0.0
+
+        if self.is_recording and self.capture_quality_audit is not None:
+            self.capture_quality_audit.record_audio_callback(frames, status, stereo)
 
         with self.audio_lock:
             if self.is_recording:
@@ -457,6 +558,9 @@ class SpotifyRecorderApp(ctk.CTk):
     def start_rec(self):
         if self.is_recording:
             return
+        if self.network_test_running:
+            self.log_message("回線実測の完了後に録音を開始してください。")
+            return
         if not self.stream and not self.start_audio_stream():
             return
 
@@ -471,6 +575,23 @@ class SpotifyRecorderApp(ctk.CTk):
             self.pre_chunks = []
             self.pre_samples = 0
             self.is_recording = True
+
+        settings = self.refresh_source_quality_status()
+        try:
+            device_name = sd.query_devices(self.device_in_id, "input")["name"]
+        except Exception:
+            device_name = f"Device {self.device_in_id}"
+        self.capture_quality_audit = CaptureQualityAudit(
+            self.sample_rate,
+            device_name,
+            settings,
+            self.last_network_test,
+            recording_frame_offset=self.total_samples_recorded,
+        )
+        self.spotify_network_monitor = SpotifyNetworkMonitor()
+        if not self.spotify_network_monitor.start():
+            self.log_message("Spotify通信量モニターを開始できません。音声録音は継続します。")
+        self.log_message(f"録音監査開始: {format_spotify_quality_settings(settings)}")
 
         self.spotify_idle_since = None
         self.recording_history = []
@@ -517,6 +638,28 @@ class SpotifyRecorderApp(ctk.CTk):
         self.is_standby = False
         self.standby_switch.deselect()
         self.stop_audio_stream()
+        capture_ended_at = time.time()
+        capture_ended_monotonic = time.monotonic()
+        network_summary = (
+            self.spotify_network_monitor.stop()
+            if self.spotify_network_monitor is not None
+            else None
+        )
+        capture_audit = (
+            self.capture_quality_audit.finish(
+                network_summary,
+                ended_at=capture_ended_at,
+                ended_monotonic=capture_ended_monotonic,
+            )
+            if self.capture_quality_audit is not None
+            else None
+        )
+        self.spotify_network_monitor = None
+        self.capture_quality_audit = None
+        if capture_audit:
+            self.log_message(f"録音監査結果: {format_capture_audit(capture_audit)}")
+            for warning in capture_audit["warnings"]:
+                self.log_message(f"録音監査警告: {warning}")
         self.status_label.configure(text="Reviewing Candidates...", text_color="#1DB954")
         self.stop_btn.configure(state="disabled")
         self.abort_btn.configure(state="disabled")
@@ -541,6 +684,8 @@ class SpotifyRecorderApp(ctk.CTk):
             "discard_tail": bool(self.discard_tail.get()),
             "discard_tail_under_sec": float(self.discard_tail_under_sec.get()),
             "record_mode": self.record_mode.get(),
+            "capture_audit": capture_audit,
+            "catalog_path": self.catalog_path,
         }
         
         self.log_message(f"録音解析開始: {len(audio) / self.sample_rate:.1f}s")
@@ -563,7 +708,15 @@ class SpotifyRecorderApp(ctk.CTk):
         review_win.transient(self)
         review_win.grab_set()
 
-        ctk.CTkLabel(review_win, text="保存候補レビュー", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=10)
+        ctk.CTkLabel(review_win, text="保存候補レビュー", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(10, 4))
+        capture_audit = options.get("capture_audit")
+        if capture_audit:
+            ctk.CTkLabel(
+                review_win,
+                text=format_capture_audit(capture_audit),
+                text_color="#63f08f" if capture_audit["quality_gate_pass"] else "#ff5964",
+                wraplength=780,
+            ).pack(padx=20, pady=(0, 6))
         
         scroll = ctk.CTkScrollableFrame(review_win)
         scroll.pack(fill="both", expand=True, padx=20, pady=10)
@@ -592,6 +745,16 @@ class SpotifyRecorderApp(ctk.CTk):
                 text += f"\n{format_analysis(analysis)}"
                 if analysis["warnings"]:
                     text += "\n⚠ " + " / ".join(analysis["warnings"])
+                    audio_locations = format_analysis_suspect_locations(analysis)
+                    if audio_locations:
+                        text += "\n音声疑い箇所:\n" + "\n".join(audio_locations)
+            audit_events = format_audit_events(
+                capture_audit,
+                cand["start"] + cand["trim_start"],
+                cand["start"] + cand["trim_end"],
+            )
+            if audit_events:
+                text += "\n疑い箇所:\n" + "\n".join(audit_events)
             
             if analysis and analysis["warnings"]:
                 text_color = "#ff5964"
@@ -633,12 +796,154 @@ class SpotifyRecorderApp(ctk.CTk):
         self.is_standby = False
         self.standby_switch.deselect()
         self.stop_audio_stream()
+        if self.spotify_network_monitor is not None:
+            self.spotify_network_monitor.stop()
+        self.spotify_network_monitor = None
+        self.capture_quality_audit = None
         with self.audio_lock:
             self.recorded_chunks = []
             self.pre_chunks = []
             self.pre_samples = 0
         self.log_message("録音を破棄しました。")
         self.on_processing_finished()
+
+    def show_recording_history(self):
+        history_win = ctk.CTkToplevel(self)
+        history_win.title("録音履歴")
+        history_win.geometry("920x650")
+        history_win.minsize(760, 520)
+        history_win.transient(self)
+
+        toolbar = ctk.CTkFrame(history_win, fg_color="transparent")
+        toolbar.pack(fill="x", padx=18, pady=(14, 8))
+        query_var = ctk.StringVar()
+        search_entry = ctk.CTkEntry(
+            toolbar,
+            textvariable=query_var,
+            placeholder_text="曲名・アーティスト・アルバム・ファイル名",
+        )
+        search_entry.pack(side="left", fill="x", expand=True)
+        count_label = ctk.CTkLabel(toolbar, text="")
+        count_label.pack(side="right", padx=(10, 0))
+
+        scroll = ctk.CTkScrollableFrame(history_win, fg_color="#11151a")
+        scroll.pack(fill="both", expand=True, padx=18, pady=(0, 14))
+
+        def open_recording(path):
+            if os.path.isfile(path):
+                subprocess.Popen(["open", path])
+
+        def reveal_recording(path):
+            if os.path.isfile(path):
+                subprocess.Popen(["open", "-R", path])
+
+        def suspect_lines(item):
+            lines = []
+            suspect = item.get("suspect_events") or {}
+            for event in suspect.get("capture", [])[:4]:
+                lines.append(
+                    f"{format_timecode(event.get('time_sec', 0.0))}: "
+                    f"{event.get('detail', event.get('type', '異常疑い'))}"
+                )
+            for event in suspect.get("full_scale_ranges", [])[:4]:
+                lines.append(f"{format_timecode(event.get('start_sec', 0.0))}: 0 dBFS到達")
+            return lines[:6]
+
+        def render(_event=None):
+            for child in scroll.winfo_children():
+                child.destroy()
+            try:
+                recordings = list_recordings(query_var.get(), database_path=self.catalog_path)
+            except Exception as exc:
+                count_label.configure(text="読込エラー")
+                ctk.CTkLabel(scroll, text=str(exc), text_color="#ff5964").pack(pady=20)
+                return
+            count_label.configure(text=f"{len(recordings)}件")
+            if not recordings:
+                ctk.CTkLabel(scroll, text="該当する録音はありません", text_color="#808995").pack(pady=24)
+                return
+
+            for item in recordings:
+                row = ctk.CTkFrame(scroll, corner_radius=6)
+                row.pack(fill="x", padx=4, pady=4)
+                row.grid_columnconfigure(0, weight=1)
+
+                if not item["file_exists"]:
+                    verdict = "ファイルなし"
+                    verdict_color = "#808995"
+                elif item["quality_gate_pass"] == 1:
+                    verdict = "合格（実効Lossless未証明）"
+                    verdict_color = "#63f08f"
+                elif item["quality_gate_pass"] == 0:
+                    verdict = "要確認"
+                    verdict_color = "#ff5964"
+                else:
+                    verdict = "未監査"
+                    verdict_color = "#f0b429"
+
+                title = f"{item['artist']} - {item['title']}"
+                try:
+                    saved_text = datetime.fromisoformat(item["saved_at"]).astimezone().strftime(
+                        "%Y-%m-%d %H:%M"
+                    )
+                except (TypeError, ValueError):
+                    saved_text = item["saved_at"]
+                details = (
+                    f"{saved_text} / {item['album']} / {item['duration_sec']:.1f}秒 / "
+                    f"{item['sample_rate']}Hz / {item['integrated_lufs']:.2f} LUFS"
+                    if item["integrated_lufs"] is not None
+                    else (
+                        f"{saved_text} / {item['album']} / {item['duration_sec']:.1f}秒 / "
+                        f"{item['sample_rate']}Hz"
+                    )
+                )
+                ctk.CTkLabel(
+                    row,
+                    text=title,
+                    anchor="w",
+                    font=ctk.CTkFont(size=14, weight="bold"),
+                ).grid(row=0, column=0, sticky="ew", padx=12, pady=(9, 0))
+                ctk.CTkLabel(row, text=verdict, text_color=verdict_color).grid(
+                    row=0, column=1, sticky="e", padx=10, pady=(9, 0)
+                )
+                ctk.CTkLabel(row, text=details, anchor="w", text_color="#aab2bd").grid(
+                    row=1, column=0, sticky="ew", padx=12, pady=(2, 3)
+                )
+                problems = suspect_lines(item)
+                if item["warnings"] or problems:
+                    warning_text = "\n".join((item["warnings"] + problems)[:6])
+                    ctk.CTkLabel(
+                        row,
+                        text=warning_text,
+                        anchor="w",
+                        justify="left",
+                        text_color="#ff9b9b",
+                        wraplength=650,
+                    ).grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
+
+                button_frame = ctk.CTkFrame(row, fg_color="transparent")
+                button_frame.grid(row=1, column=1, rowspan=2, sticky="e", padx=8, pady=6)
+                state = "normal" if item["file_exists"] else "disabled"
+                ctk.CTkButton(
+                    button_frame,
+                    text="再生",
+                    width=58,
+                    height=26,
+                    state=state,
+                    command=lambda path=item["file_path"]: open_recording(path),
+                ).pack(side="left", padx=3)
+                ctk.CTkButton(
+                    button_frame,
+                    text="Finder",
+                    width=64,
+                    height=26,
+                    state=state,
+                    command=lambda path=item["file_path"]: reveal_recording(path),
+                ).pack(side="left", padx=3)
+
+        ctk.CTkButton(toolbar, text="検索", width=70, command=render).pack(side="left", padx=(8, 0))
+        search_entry.bind("<Return>", render)
+        render()
 
     def on_processing_finished(self):
         def update():
@@ -669,6 +974,13 @@ class SpotifyRecorderApp(ctk.CTk):
             self.track_label.configure(text=info["name"], text_color="white")
             self.artist_label.configure(text=f"{info['artist']} - {info['album']} / {info['state']}", text_color="#b7bec8")
 
+            if self.is_recording and self.capture_quality_audit is not None:
+                self.capture_quality_audit.observe_spotify_playback(
+                    normalized_track_key(info),
+                    info.get("state"),
+                    info.get("position"),
+                )
+
             if self.is_standby and not self.is_recording and info.get("state") == "playing":
                 self.log_message(f"Spotify再生検知: {info['artist']} - {info['name']}")
                 self.start_rec()
@@ -698,6 +1010,8 @@ class SpotifyRecorderApp(ctk.CTk):
                     self.log_message(f"曲変更: {info['artist']} - {info['name']}")
 
         elif info.get("status") in ("IDLE", "CLOSED"):
+            if self.is_recording and self.capture_quality_audit is not None:
+                self.capture_quality_audit.observe_spotify_playback(None, "idle", None)
             if info.get("status") == "CLOSED":
                 self.track_label.configure(text="Spotify is closed", text_color="#b7bec8")
             else:
@@ -715,6 +1029,8 @@ class SpotifyRecorderApp(ctk.CTk):
 
     def on_closing(self):
         self.stop_audio_stream()
+        if self.spotify_network_monitor is not None:
+            self.spotify_network_monitor.stop()
         self.destroy()
 
 

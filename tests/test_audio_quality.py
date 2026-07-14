@@ -9,6 +9,7 @@ from mutagen.wave import WAVE
 
 from spotify_recorder_services import (
     analyze_audio,
+    format_analysis_suspect_locations,
     process_and_save_candidates,
 )
 
@@ -41,6 +42,16 @@ class AudioAnalysisTests(unittest.TestCase):
         self.assertGreater(result["sample_peak"], 1.0)
         self.assertGreater(result["full_scale_sample_count"], 0)
         self.assertIn("入力値が0 dBFSを超えています", result["warnings"])
+
+    def test_reports_clipping_suspect_location(self):
+        audio = np.zeros((SAMPLE_RATE, 2), dtype=np.float32)
+        audio[1234:1236] = 1.0
+
+        result = analyze_audio(audio, SAMPLE_RATE)
+        locations = format_analysis_suspect_locations(result)
+
+        self.assertEqual(result["full_scale_ranges"][0]["start_frame"], 1234)
+        self.assertTrue(any("0 dBFS" in location for location in locations))
 
     def test_rejects_non_finite_samples(self):
         for invalid in (np.nan, np.inf, -np.inf):
@@ -128,6 +139,74 @@ class FloatWavSaveTests(unittest.TestCase):
             self.assertEqual(tags.get("TXXX:WAV Encoding").text, ["32-bit IEEE float"])
             self.assertIsNotNone(tags.get("TXXX:Integrated LUFS"))
             self.assertIsNotNone(tags.get("TXXX:True Peak dBTP"))
+
+    def test_embeds_capture_integrity_audit(self):
+        audio = stereo_sine(-6.0)
+        capture_audit = {
+            "assurance_label": "品質条件に要確認・実効Lossless未証明",
+            "sample_rate": SAMPLE_RATE,
+            "spotify_settings": {
+                "streaming_quality_raw": 5,
+                "auto_downgrade": False,
+            },
+            "callback_status_count": 1,
+            "playback_stall_count": 1,
+            "playback_stall_sec": 1.25,
+            "timeline_slip_count": 1,
+            "max_timeline_slip_sec": 1.25,
+            "digital_zero_run_count": 1,
+            "longest_digital_zero_sec": 0.75,
+            "repeated_audio_blocks": 0,
+            "boundary_discontinuities": 1,
+            "warnings": ["テスト警告"],
+            "events": [
+                {
+                    "type": "playback_stall",
+                    "sample": 100,
+                    "duration_sec": 1.25,
+                    "detail": "Spotify再生位置の停止疑い: 1.25秒",
+                },
+                {
+                    "type": "timeline_slip",
+                    "sample": 101,
+                    "duration_sec": 0.0,
+                    "value_sec": 1.25,
+                    "detail": "録音とSpotifyタイムラインの滑り疑い: +1.25秒",
+                },
+                {
+                    "type": "digital_silence",
+                    "sample": 102,
+                    "duration_sec": 0.75,
+                    "detail": "デジタル無音の継続疑い: 0.75秒",
+                },
+                {
+                    "type": "boundary_discontinuity",
+                    "sample": 103,
+                    "duration_sec": 0.0,
+                    "detail": "コールバック境界の不連続疑い",
+                },
+                {
+                    "type": "audio_callback",
+                    "sample": 104,
+                    "duration_sec": 0.0,
+                    "detail": "音声コールバック異常: input overflow",
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path, _ = self.save_candidate(
+                audio,
+                directory,
+                {"capture_audit": capture_audit},
+            )
+            tags = WAVE(path).tags
+
+            self.assertEqual(tags.get("TXXX:Lossless Verified").text[0].split(" - ")[0], "No")
+            self.assertIn("1 events", tags.get("TXXX:Playback Stall Suspicions").text[0])
+            self.assertIn("1 events", tags.get("TXXX:Timeline Slip Suspicions").text[0])
+            self.assertEqual(tags.get("TXXX:Callback Boundary Discontinuities").text, ["1"])
+            self.assertIn("停止疑い", tags.get("TXXX:Capture Suspect Locations").text[0])
 
 
 if __name__ == "__main__":
