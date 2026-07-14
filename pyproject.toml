@@ -1,7 +1,7 @@
 [project]
-name = "playground"
-version = "0.1.0"
-description = "Add your description here"
+name = "hi-res-recorder"
+version = "4.0.0"
+description = "Unity-gain float WAV recorder with Spotify and Qobuz quality auditing"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

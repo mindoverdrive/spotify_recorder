@@ -4,12 +4,21 @@ import subprocess
 import threading
 import time
 from datetime import datetime
-from tkinter import filedialog
+from tkinter import TclError, filedialog
 
 import customtkinter as ctk
 import numpy as np
 import sounddevice as sd
+import soundfile as sf
 
+from capture_spool import (
+    CaptureSpool,
+    SpoolAudio,
+    capture_blocksize,
+    check_capture_disk_space,
+    list_recoverable_sessions,
+)
+from coreaudio_devices import resolve_coreaudio_device
 from recording_catalog import default_catalog_path, list_recordings
 from spotify_recorder_services import (
     MODE_PRESETS,
@@ -19,14 +28,13 @@ from spotify_recorder_services import (
     build_diagnostic_lines,
     format_analysis,
     format_analysis_suspect_locations,
-    get_spotify_info_extended,
     normalized_track_key,
     prepare_track_candidates,
     process_and_save_candidates,
 )
 from spotify_quality_audit import (
     CaptureQualityAudit,
-    SpotifyNetworkMonitor,
+    ProcessNetworkMonitor,
     evaluate_spotify_quality_settings,
     format_audit_events,
     format_capture_audit,
@@ -36,27 +44,37 @@ from spotify_quality_audit import (
     read_spotify_quality_settings,
     run_network_quality_test,
 )
+from source_providers import (
+    PROVIDER_QOBUZ,
+    PROVIDER_SPOTIFY,
+    PROVIDERS,
+    QOBUZ_MODES,
+    QOBUZ_OFFLINE,
+    create_provider_adapters,
+)
 
 CHECK_INTERVAL_MS = 800
 DEFAULT_SAMPLE_RATE = 44100
-DEFAULT_PRE_BUFFER_SEC = 3.0
+DEFAULT_PRE_BUFFER_SEC = 5.0
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("green")
 
 
-class SpotifyRecorderApp(ctk.CTk):
+class HiResRecorderApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Spotify Recorder Native")
-        self.geometry("780x860")
-        self.minsize(700, 800)
+        self.title("Hi-Res Recorder")
+        self.geometry("860x940")
+        self.minsize(760, 860)
 
         self.is_recording = False
         self.is_standby = False
         self.stream = None
         self.audio_lock = threading.Lock()
-        self.recorded_chunks = []
+        self.capture_spool = None
+        self.pending_spool_audio = None
+        self.spool_failure_handled = False
         self.pre_chunks = []
         self.pre_samples = 0
         self.total_samples_recorded = 0
@@ -71,10 +89,17 @@ class SpotifyRecorderApp(ctk.CTk):
         self.network_test_running = False
         self.capture_quality_audit = None
         self.spotify_network_monitor = None
+        self.provider_adapters = create_provider_adapters()
         self.catalog_path = default_catalog_path()
 
         self.log_queue = queue.Queue()
-        self.save_dir = ctk.StringVar(value=os.path.expanduser("~/Desktop/Spotify_recodings"))
+        self.save_dir = ctk.StringVar(value=os.path.expanduser("~/Music/Hi-Res Recorder"))
+        self.provider = ctk.StringVar(value=PROVIDER_SPOTIFY)
+        self.qobuz_mode = ctk.StringVar(value=QOBUZ_OFFLINE)
+        self.qobuz_manual_rate = ctk.IntVar(value=44100)
+        self.qobuz_manual_depth = ctk.IntVar(value=24)
+        self.qobuz_manual_confirmed = ctk.BooleanVar(value=False)
+        self.maximum_recording_minutes = ctk.IntVar(value=120)
         self.record_ch_start = ctk.IntVar(value=5)
         self.silence_threshold_db = ctk.DoubleVar(value=-60.0)
         self.pad_start_sec = ctk.DoubleVar(value=0.10)
@@ -100,7 +125,13 @@ class SpotifyRecorderApp(ctk.CTk):
         self.build_ui()
         self.load_past_logs()
         self.refresh_source_quality_status(log_result=True)
-        self.after(CHECK_INTERVAL_MS, self.poll_spotify)
+        self.recoverable_sessions = list_recoverable_sessions()
+        if self.recoverable_sessions:
+            self.log_message(
+                f"前回の録音スプールが{len(self.recoverable_sessions)}件あります。復旧確認を表示します。"
+            )
+            self.after(300, self.show_recovery_prompt)
+        self.after(CHECK_INTERVAL_MS, self.poll_source)
         self.after(50, self.process_queues)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -135,9 +166,28 @@ class SpotifyRecorderApp(ctk.CTk):
         )
         self.status_label.pack(pady=(8, 4))
 
+        source_controls = ctk.CTkFrame(root, fg_color="transparent")
+        source_controls.pack(fill="x", padx=18, pady=2)
+        ctk.CTkLabel(source_controls, text="サービス").pack(side="left")
+        self.provider_menu = ctk.CTkSegmentedButton(
+            source_controls,
+            values=PROVIDERS,
+            variable=self.provider,
+            command=self.on_provider_change,
+        )
+        self.provider_menu.pack(side="left", padx=(8, 18))
+        ctk.CTkLabel(source_controls, text="Qobuz経路").pack(side="left")
+        self.qobuz_mode_menu = ctk.CTkSegmentedButton(
+            source_controls,
+            values=QOBUZ_MODES,
+            variable=self.qobuz_mode,
+            command=lambda _value: self.refresh_source_quality_status(log_result=True),
+        )
+        self.qobuz_mode_menu.pack(side="left", padx=8)
+
         info = ctk.CTkFrame(root, fg_color="#1f2328", corner_radius=8)
         info.pack(fill="x", padx=18, pady=4)
-        self.track_label = ctk.CTkLabel(info, text="Spotify: checking...", font=ctk.CTkFont(size=16, weight="bold"))
+        self.track_label = ctk.CTkLabel(info, text="ソース確認中...", font=ctk.CTkFont(size=16, weight="bold"))
         self.track_label.pack(pady=(8, 2))
         self.artist_label = ctk.CTkLabel(info, text="-", text_color="#b7bec8")
         self.artist_label.pack(pady=(0, 2))
@@ -176,14 +226,14 @@ class SpotifyRecorderApp(ctk.CTk):
         switches.pack(fill="x", padx=18, pady=4)
         self.standby_switch = ctk.CTkSwitch(
             switches,
-            text="Standby: Spotify再生で自動開始",
+            text="Standby: ソース再生で自動開始",
             progress_color="#1DB954",
             command=self.on_standby_toggle,
         )
         self.standby_switch.pack(anchor="w", pady=2)
         self.auto_stop_switch = ctk.CTkSwitch(
             switches,
-            text="Spotify停止/一時停止で自動停止",
+            text="ソース停止/一時停止で自動停止",
             variable=self.auto_stop_on_idle,
             progress_color="#1DB954",
         )
@@ -246,17 +296,27 @@ class SpotifyRecorderApp(ctk.CTk):
             self.in_combo.set(current)
 
         self.setting_entries = []
-        self.add_entry(settings, 1, "開始ch", self.record_ch_start, "Loopback等でのSpotify出力先ch")
+        self.add_entry(settings, 1, "開始ch", self.record_ch_start, "単一Loopback/BlackHoleの出力先ch")
         self.add_entry(settings, 2, "無音閾値 dB", self.silence_threshold_db, "例: -60")
         self.add_entry(settings, 3, "開始余白 秒", self.pad_start_sec, "フェードイン保護")
         self.add_entry(settings, 4, "終了余白 秒", self.pad_end_sec, "余韻保護")
         self.add_entry(settings, 5, "通常スキップ 秒", self.min_keep_sec, "これ未満の曲候補は保存しない")
         self.add_entry(settings, 6, "最終断片 秒", self.discard_tail_under_sec, "停止時の最終曲がこれ以下なら破棄")
-        self.add_entry(settings, 7, "自動停止猶予 秒", self.auto_stop_grace_sec, "Spotify停止後に待つ秒数")
+        self.add_entry(settings, 7, "自動停止猶予 秒", self.auto_stop_grace_sec, "ソース停止後に待つ秒数")
+        self.add_entry(settings, 8, "最大録音 分", self.maximum_recording_minutes, "空き容量の事前検査に使用")
+        self.add_entry(settings, 9, "Qobuz手動 Hz", self.qobuz_manual_rate, "Streaming代替証跡")
+        self.add_entry(settings, 10, "Qobuz手動 bit", self.qobuz_manual_depth, "16または24")
+        self.qobuz_confirm_switch = ctk.CTkSwitch(
+            settings,
+            text="Qobuz音量100% / Exclusive ON / Stereoを手動確認",
+            variable=self.qobuz_manual_confirmed,
+            progress_color="#1DB954",
+        )
+        self.qobuz_confirm_switch.grid(row=11, column=1, sticky="w", padx=12, pady=6)
 
-        ctk.CTkLabel(settings, text="保存先").grid(row=8, column=0, sticky="w", padx=12, pady=8)
+        ctk.CTkLabel(settings, text="保存先").grid(row=12, column=0, sticky="w", padx=12, pady=8)
         dir_frame = ctk.CTkFrame(settings, fg_color="transparent")
-        dir_frame.grid(row=8, column=1, sticky="ew", padx=12, pady=8)
+        dir_frame.grid(row=12, column=1, sticky="ew", padx=12, pady=8)
         dir_frame.grid_columnconfigure(0, weight=1)
         self.dir_label = ctk.CTkLabel(dir_frame, textvariable=self.save_dir, anchor="w", fg_color="#252b33", corner_radius=5)
         self.dir_label.grid(row=0, column=0, sticky="ew", padx=(0, 8))
@@ -312,6 +372,7 @@ class SpotifyRecorderApp(ctk.CTk):
         if not self.input_devices:
             self.start_btn.configure(state="disabled")
             self.log_message("入力デバイスが見つかりません。Loopback/BlackHole設定を確認してください。")
+        self.on_provider_change(self.provider.get(), refresh=False)
 
     def add_entry(self, parent, row, label, variable, hint):
         ctk.CTkLabel(parent, text=label).grid(row=row, column=0, sticky="w", padx=12, pady=4)
@@ -329,6 +390,15 @@ class SpotifyRecorderApp(ctk.CTk):
         self.browse_btn.configure(state=locked_state)
         self.standby_switch.configure(state=locked_state)
         self.mode_menu.configure(state=locked_state)
+        self.provider_menu.configure(state=locked_state)
+        self.qobuz_mode_menu.configure(
+            state=(
+                "disabled"
+                if recording or self.provider.get() != PROVIDER_QOBUZ
+                else "normal"
+            )
+        )
+        self.qobuz_confirm_switch.configure(state=locked_state)
         self.diag_btn.configure(state=locked_state)
         self.network_test_btn.configure(
             state="disabled" if recording or self.network_test_running else "normal"
@@ -350,12 +420,26 @@ class SpotifyRecorderApp(ctk.CTk):
             self.write_log_to_file(formatted_msg)
 
         self.level_meter.set(min(1.0, self.latest_level * 8.0))
+        if (
+            self.is_recording
+            and self.capture_spool is not None
+            and self.capture_spool.error
+            and not self.spool_failure_handled
+        ):
+            self.spool_failure_handled = True
+            self.log_message(f"重大録音エラー: {self.capture_spool.error}")
+            if self.capture_quality_audit is not None:
+                self.capture_quality_audit.add_external_event(
+                    "spool_overflow",
+                    self.capture_spool.error,
+                )
+            self.stop_rec()
         self.after(50, self.process_queues)
 
     def load_past_logs(self):
-        log_dir = os.path.expanduser("~/Desktop/Spotify_recodings")
+        log_dir = os.path.expanduser("~/Library/Application Support/HiResRecorder/Logs")
         os.makedirs(log_dir, exist_ok=True)
-        self.log_file_path = os.path.join(log_dir, "spotify_recorder.log")
+        self.log_file_path = os.path.join(log_dir, "hires_recorder.log")
         
         past_log = ""
         if os.path.exists(self.log_file_path):
@@ -380,12 +464,186 @@ class SpotifyRecorderApp(ctk.CTk):
         except Exception:
             pass
 
+    def show_recovery_prompt(self):
+        if not self.recoverable_sessions:
+            return
+        window = ctk.CTkToplevel(self)
+        window.title("録音スプールの復旧")
+        window.geometry("520x230")
+        window.transient(self)
+        window.grab_set()
+        latest = self.recoverable_sessions[-1]
+        duration = (
+            int(latest.get("frames", 0)) / int(latest.get("sample_rate") or 1)
+        )
+        ctk.CTkLabel(
+            window,
+            text="前回終了時に未処理の録音があります",
+            font=ctk.CTkFont(size=17, weight="bold"),
+        ).pack(pady=(22, 8))
+        ctk.CTkLabel(
+            window,
+            text=(
+                f"{len(self.recoverable_sessions)}件 / 最新 {duration:.1f}秒 / "
+                f"{latest.get('sample_rate')}Hz\n元データを変更せず、全体WAV候補としてレビューします。"
+            ),
+            text_color="#b7bec8",
+        ).pack(padx=20)
+        buttons = ctk.CTkFrame(window, fg_color="transparent")
+        buttons.pack(fill="x", padx=22, pady=22)
+
+        def recover():
+            window.destroy()
+            self.recover_spool(latest)
+
+        def discard_all():
+            for payload in self.recoverable_sessions:
+                for path in (payload.get("raw_path"), payload.get("metadata_path")):
+                    if path:
+                        try:
+                            os.remove(path)
+                        except FileNotFoundError:
+                            pass
+            self.recoverable_sessions = []
+            window.destroy()
+            self.log_message("残存録音スプールを破棄しました。")
+
+        ctk.CTkButton(buttons, text="最新を復旧", command=recover).pack(side="right", padx=5)
+        ctk.CTkButton(
+            buttons,
+            text="すべて破棄",
+            fg_color="#e91429",
+            hover_color="#ff3348",
+            command=discard_all,
+        ).pack(side="right", padx=5)
+        ctk.CTkButton(
+            buttons,
+            text="後で",
+            fg_color="#414852",
+            command=window.destroy,
+        ).pack(side="right", padx=5)
+
+    def recover_spool(self, payload):
+        if self.is_recording or self.pending_spool_audio is not None:
+            self.log_message("録音中またはレビュー中のため復旧できません。")
+            return
+        frames = int(payload.get("frames") or 0)
+        if frames <= 0:
+            self.log_message("復旧対象に音声フレームがありません。")
+            return
+        audio = SpoolAudio(
+            payload["raw_path"],
+            payload["metadata_path"],
+            int(payload["sample_rate"]),
+            int(payload.get("channels") or 2),
+            frames,
+        )
+        self.pending_spool_audio = audio
+        sample_rate = int(payload["sample_rate"])
+        history = [
+            {
+                "name": datetime.now().strftime("Recovered_%Y%m%d_%H%M%S"),
+                "artist": "Unknown",
+                "album": "Recovered Capture",
+                "start_sample": 0,
+                "key": None,
+                "artwork_url": None,
+                "provider": "unknown",
+                "source_mode": "recovered",
+            }
+        ]
+        options = {
+            "save_dir": self.save_dir.get(),
+            "sample_rate": sample_rate,
+            "threshold_db": float(self.silence_threshold_db.get()),
+            "pad_start_sec": float(self.pad_start_sec.get()),
+            "pad_end_sec": float(self.pad_end_sec.get()),
+            "min_keep_sec": 0.0,
+            "discard_tail": False,
+            "discard_tail_under_sec": 0.0,
+            "record_mode": MODE_MANUAL,
+            "capture_audit": None,
+            "catalog_path": self.catalog_path,
+            "audio_source": audio,
+        }
+        self.status_label.configure(text="Recovering Capture...", text_color="#f0b429")
+
+        def evaluate():
+            try:
+                candidates = prepare_track_candidates(
+                    audio, history, options, None, self.log_message
+                )
+                self.after(0, lambda: self.show_review_ui(candidates, options))
+            except Exception as exc:
+                self.log_message(f"録音スプール復旧エラー: {exc}")
+                self.after(0, self.on_processing_finished)
+
+        threading.Thread(target=evaluate, daemon=True).start()
+
     def on_device_change(self, _):
         if not self.input_device_strings:
             return
         self.device_in_id = int(self.in_combo.get().split(":", 1)[0])
         self.update_sample_rate()
         self.log_message(f"入力デバイス: {self.device_in_id} / {self.sample_rate}Hz")
+        self.refresh_source_quality_status()
+
+    def current_adapter(self):
+        return self.provider_adapters[self.provider.get()]
+
+    def on_provider_change(self, value, refresh=True):
+        is_qobuz = value == PROVIDER_QOBUZ
+        self.qobuz_mode_menu.configure(state="normal" if is_qobuz else "disabled")
+        self.standby_switch.configure(
+            text=f"Standby: {value}再生で自動開始"
+        )
+        self.auto_stop_switch.configure(text=f"{value}停止/一時停止で自動停止")
+        self.current_spotify_info = None
+        self.last_track_key = None
+        self.last_network_test = None
+        if refresh:
+            self.refresh_source_quality_status(log_result=True)
+
+    def qobuz_manual_source(self):
+        return {
+            "source_sample_rate": int(self.qobuz_manual_rate.get()),
+            "source_bit_depth": int(self.qobuz_manual_depth.get()),
+            "source_channels": 2,
+            "confirmed": bool(self.qobuz_manual_confirmed.get()),
+        }
+
+    def current_device_profile(self):
+        if self.device_in_id is None:
+            raise RuntimeError("入力デバイスがありません")
+        device_info = sd.query_devices(self.device_in_id, "input")
+        coreaudio = resolve_coreaudio_device(device_info["name"], self.audio_devices)
+        profile = coreaudio.to_dict()
+        profile["max_input_channels"] = int(device_info["max_input_channels"])
+        return profile
+
+    def source_preflight(self):
+        adapter = self.current_adapter()
+        try:
+            device = self.current_device_profile()
+        except Exception as exc:
+            if self.provider.get() == PROVIDER_QOBUZ:
+                return {
+                    "conditions_pass": False,
+                    "warnings": [str(exc)],
+                    "assurance_label": "Qobuz録音経路を検証できません",
+                    "source_sample_rate": None,
+                }
+            device_info = sd.query_devices(self.device_in_id, "input")
+            device = {
+                "name": device_info["name"],
+                "nominal_sample_rate": self.sample_rate,
+                "max_input_channels": int(device_info["max_input_channels"]),
+            }
+        return adapter.preflight(
+            device,
+            mode=self.qobuz_mode.get(),
+            manual_source=self.qobuz_manual_source(),
+        )
 
     def browse_dir(self):
         folder = filedialog.askdirectory(initialdir=self.save_dir.get())
@@ -394,8 +652,23 @@ class SpotifyRecorderApp(ctk.CTk):
             
     def run_diagnostics(self):
         self.log_message("=== 診断を実行中 ===")
+        adapter = self.current_adapter()
+        mode = self.qobuz_mode.get()
+        manual_source = self.qobuz_manual_source()
+        sample_rate = self.sample_rate
+
         def diag_thread():
-            lines = build_diagnostic_lines(self.sample_rate)
+            device = None
+            try:
+                device = self.current_device_profile()
+            except Exception as exc:
+                self.log_message(f"CoreAudio診断: {exc}")
+            lines = adapter.diagnostics(
+                sample_rate,
+                device=device,
+                mode=mode,
+                manual_source=manual_source,
+            )
             for line in lines:
                 self.log_message(line)
             self.after(0, self.refresh_source_quality_status)
@@ -403,16 +676,16 @@ class SpotifyRecorderApp(ctk.CTk):
         threading.Thread(target=diag_thread, daemon=True).start()
 
     def refresh_source_quality_status(self, log_result=False):
-        self.spotify_quality_settings = read_spotify_quality_settings()
-        evaluation = evaluate_spotify_quality_settings(self.spotify_quality_settings)
+        status = self.current_adapter().quality_status()
+        self.spotify_quality_settings = status.settings
         self.source_quality_label.configure(
-            text=f"ソース品質: {evaluation['label']}",
-            text_color="#63f08f" if evaluation["conditions_pass"] else "#f0b429",
+            text=f"ソース品質: {status.label}",
+            text_color="#63f08f" if status.conditions_pass else "#f0b429",
         )
         if log_result:
-            self.log_message(
-                f"Spotify設定監査: {format_spotify_quality_settings(self.spotify_quality_settings)}"
-            )
+            self.log_message(f"{self.provider.get()}設定監査: {self.current_adapter().format_quality(status)}")
+            for warning in status.warnings:
+                self.log_message(f"設定警告: {warning}")
         return self.spotify_quality_settings
 
     def run_network_preflight(self):
@@ -423,14 +696,22 @@ class SpotifyRecorderApp(ctk.CTk):
         self.network_test_btn.configure(state="disabled", text="実測中...")
         self.log_message("Apple networkQualityで下り回線を実測します。通信量が発生します。")
 
+        adapter = self.current_adapter()
+
         def test_thread():
-            result = run_network_quality_test()
-            self.last_network_test = result
+            result = run_network_quality_test(
+                minimum_mbps=adapter.recommended_min_mbps,
+                provider_label=adapter.name,
+            )
             self.log_message(f"回線実測: {format_network_quality(result)}")
             for warning in result.get("warnings", []):
                 self.log_message(f"回線警告: {warning}")
 
             def finish_ui():
+                if self.provider.get() == adapter.name:
+                    self.last_network_test = result
+                else:
+                    self.log_message("サービス変更後に完了した回線実測結果は破棄しました。")
                 self.network_test_running = False
                 self.network_test_btn.configure(state="normal", text="回線実測")
 
@@ -445,7 +726,7 @@ class SpotifyRecorderApp(ctk.CTk):
                 self.status_label.configure(text="Standby", text_color="#f0b429")
                 self.pre_chunks = []
                 self.pre_samples = 0
-                self.log_message("Standby有効: Spotifyの再生を待機します。")
+                self.log_message(f"Standby有効: {self.provider.get()}の再生を待機します。")
             else:
                 self.is_standby = False
                 self.standby_switch.deselect()
@@ -467,12 +748,17 @@ class SpotifyRecorderApp(ctk.CTk):
         self.latest_level = float(np.sqrt(np.mean(stereo * stereo))) if stereo.size else 0.0
 
         if self.is_recording and self.capture_quality_audit is not None:
-            self.capture_quality_audit.record_audio_callback(frames, status, stereo)
+            self.capture_quality_audit.record_audio_callback(
+                frames,
+                status,
+                stereo,
+                adc_time=getattr(time_info, "inputBufferAdcTime", None),
+            )
 
         with self.audio_lock:
             if self.is_recording:
-                self.recorded_chunks.append(stereo.copy())
-                self.total_samples_recorded += len(stereo)
+                if self.capture_spool is not None and self.capture_spool.try_write(stereo):
+                    self.total_samples_recorded += len(stereo)
             elif self.is_standby:
                 self.pre_chunks.append(stereo.copy())
                 self.pre_samples += len(stereo)
@@ -503,7 +789,7 @@ class SpotifyRecorderApp(ctk.CTk):
                 samplerate=self.sample_rate,
                 channels=max_channels,
                 dtype="float32",
-                blocksize=2048,
+                blocksize=capture_blocksize(self.sample_rate),
                 latency="high",
                 callback=self.audio_callback,
             )
@@ -540,7 +826,16 @@ class SpotifyRecorderApp(ctk.CTk):
             "album": info["album"],
             "start_sample": start_sample,
             "key": normalized_track_key(info),
-            "artwork_url": info.get("artwork_url")
+            "artwork_url": info.get("artwork_url"),
+            "provider": str(info.get("provider") or self.provider.get()).lower(),
+            "source_mode": (
+                self.qobuz_mode.get().lower()
+                if self.provider.get() == PROVIDER_QOBUZ
+                else info.get("source_mode", "streaming")
+            ),
+            "track_id": info.get("track_id"),
+            "source_sample_rate": info.get("source_sample_rate"),
+            "source_bit_depth": info.get("source_bit_depth"),
         }
         self.recording_history.append(item)
         self.last_track_key = item["key"]
@@ -561,19 +856,58 @@ class SpotifyRecorderApp(ctk.CTk):
         if self.network_test_running:
             self.log_message("回線実測の完了後に録音を開始してください。")
             return
+        self.update_sample_rate()
+        try:
+            maximum_minutes = int(self.maximum_recording_minutes.get())
+            if maximum_minutes <= 0:
+                raise ValueError("最大録音時間は1分以上にしてください")
+            source_evaluation = self.source_preflight()
+        except (TclError, TypeError, ValueError) as exc:
+            self.log_message(f"録音設定エラー: {exc}")
+            return
+        if self.provider.get() == PROVIDER_QOBUZ and not source_evaluation["conditions_pass"]:
+            self.log_message("Qobuz厳格品質ゲートにより録音開始を拒否しました。")
+            for warning in source_evaluation.get("warnings", []):
+                self.log_message(f"開始拒否: {warning}")
+            return
+        disk = check_capture_disk_space(
+            os.path.expanduser("~/Library/Caches/HiResRecorder/Sessions"),
+            self.save_dir.get(),
+            self.sample_rate,
+            maximum_minutes,
+        )
+        if not disk["ok"]:
+            self.log_message(
+                "録音開始拒否: スプールと最終WAV用の空き容量が不足しています "
+                f"(必要 {disk['required_bytes'] / 1024**3:.1f} GiB)"
+            )
+            return
         if not self.stream and not self.start_audio_stream():
             return
 
         with self.audio_lock:
-            self.recorded_chunks = []
+            pre_roll = []
             if self.is_standby and self.pre_chunks:
-                self.recorded_chunks.extend(chunk.copy() for chunk in self.pre_chunks)
+                pre_roll = [chunk.copy() for chunk in self.pre_chunks]
                 self.total_samples_recorded = self.pre_samples
                 self.log_message(f"事前バッファ追加: {self.pre_samples / self.sample_rate:.2f}s")
             else:
                 self.total_samples_recorded = 0
             self.pre_chunks = []
             self.pre_samples = 0
+            self.capture_spool = CaptureSpool(
+                self.sample_rate,
+                channels=2,
+                blocksize=capture_blocksize(self.sample_rate),
+            )
+            try:
+                self.capture_spool.start(pre_roll)
+            except Exception as exc:
+                self.capture_spool.discard()
+                self.capture_spool = None
+                self.log_message(f"録音スプール開始エラー: {exc}")
+                return
+            self.spool_failure_handled = False
             self.is_recording = True
 
         settings = self.refresh_source_quality_status()
@@ -587,11 +921,17 @@ class SpotifyRecorderApp(ctk.CTk):
             settings,
             self.last_network_test,
             recording_frame_offset=self.total_samples_recorded,
+            provider=self.provider.get().lower(),
+            source_evaluation=source_evaluation,
         )
-        self.spotify_network_monitor = SpotifyNetworkMonitor()
+        adapter = self.current_adapter()
+        self.spotify_network_monitor = ProcessNetworkMonitor(
+            adapter.process_prefixes,
+            adapter.name,
+        )
         if not self.spotify_network_monitor.start():
-            self.log_message("Spotify通信量モニターを開始できません。音声録音は継続します。")
-        self.log_message(f"録音監査開始: {format_spotify_quality_settings(settings)}")
+            self.log_message(f"{adapter.name}通信量モニターを開始できません。音声録音は継続します。")
+        self.log_message(f"録音監査開始: {source_evaluation['assurance_label']}")
 
         self.spotify_idle_since = None
         self.recording_history = []
@@ -615,7 +955,7 @@ class SpotifyRecorderApp(ctk.CTk):
                 }
             )
             self.status_label.configure(text="Recording", text_color="#e91429")
-            self.log_message("録音開始: Spotifyメタデータ未取得")
+            self.log_message(f"録音開始: {self.provider.get()}メタデータ未取得")
 
         self.set_controls_recording(True)
 
@@ -623,7 +963,7 @@ class SpotifyRecorderApp(ctk.CTk):
         if not self.is_recording:
             return
 
-        stop_info = get_spotify_info_extended()
+        stop_info = self.current_adapter().snapshot()
         if stop_info.get("status") != "OK":
             stop_info = self.current_spotify_info
         elif normalized_track_key(stop_info) != self.last_track_key and self.last_track_key is not None:
@@ -640,6 +980,18 @@ class SpotifyRecorderApp(ctk.CTk):
         self.stop_audio_stream()
         capture_ended_at = time.time()
         capture_ended_monotonic = time.monotonic()
+        spool = self.capture_spool
+        self.capture_spool = None
+        spool_audio = None
+        spool_error = None
+        if spool is not None:
+            try:
+                spool_audio = spool.stop()
+                spool_error = spool.error
+            except Exception as exc:
+                spool_error = str(exc)
+        if spool_error and self.capture_quality_audit is not None:
+            self.capture_quality_audit.add_external_event("spool_overflow", spool_error)
         network_summary = (
             self.spotify_network_monitor.stop()
             if self.spotify_network_monitor is not None
@@ -664,16 +1016,13 @@ class SpotifyRecorderApp(ctk.CTk):
         self.stop_btn.configure(state="disabled")
         self.abort_btn.configure(state="disabled")
 
-        with self.audio_lock:
-            chunks = list(self.recorded_chunks)
-            self.recorded_chunks = []
-
-        if not chunks:
-            self.log_message("録音データがありません。")
+        if spool_audio is None:
+            self.log_message(f"録音データを確定できません: {spool_error or 'データなし'}")
             self.on_processing_finished()
             return
 
-        audio = np.concatenate(chunks, axis=0)
+        audio = spool_audio
+        self.pending_spool_audio = spool_audio
         options = {
             "save_dir": self.save_dir.get(),
             "sample_rate": self.sample_rate,
@@ -686,6 +1035,7 @@ class SpotifyRecorderApp(ctk.CTk):
             "record_mode": self.record_mode.get(),
             "capture_audit": capture_audit,
             "catalog_path": self.catalog_path,
+            "audio_source": spool_audio,
         }
         
         self.log_message(f"録音解析開始: {len(audio) / self.sample_rate:.1f}s")
@@ -756,7 +1106,9 @@ class SpotifyRecorderApp(ctk.CTk):
             if audit_events:
                 text += "\n疑い箇所:\n" + "\n".join(audit_events)
             
-            if analysis and analysis["warnings"]:
+            if (analysis and analysis["warnings"]) or (
+                capture_audit and not capture_audit.get("quality_gate_pass")
+            ):
                 text_color = "#ff5964"
             else:
                 text_color = "white" if cand["default_checked"] else "#808995"
@@ -789,7 +1141,7 @@ class SpotifyRecorderApp(ctk.CTk):
         ctk.CTkButton(btn_frame, text="Cancel & Discard", fg_color="#e91429", hover_color="#ff3348", command=on_cancel).pack(side="right")
 
     def abort_rec(self):
-        if not self.is_recording:
+        if not self.is_recording and self.pending_spool_audio is None:
             return
         self.was_standby = self.is_standby  # スタンドバイ状態を記憶
         self.is_recording = False
@@ -800,8 +1152,13 @@ class SpotifyRecorderApp(ctk.CTk):
             self.spotify_network_monitor.stop()
         self.spotify_network_monitor = None
         self.capture_quality_audit = None
+        if self.capture_spool is not None:
+            self.capture_spool.discard()
+            self.capture_spool = None
+        if self.pending_spool_audio is not None:
+            self.pending_spool_audio.close(delete=True)
+            self.pending_spool_audio = None
         with self.audio_lock:
-            self.recorded_chunks = []
             self.pre_chunks = []
             self.pre_samples = 0
         self.log_message("録音を破棄しました。")
@@ -817,6 +1174,8 @@ class SpotifyRecorderApp(ctk.CTk):
         toolbar = ctk.CTkFrame(history_win, fg_color="transparent")
         toolbar.pack(fill="x", padx=18, pady=(14, 8))
         query_var = ctk.StringVar()
+        provider_filter = ctk.StringVar(value="すべて")
+        verdict_filter = ctk.StringVar(value="すべて")
         search_entry = ctk.CTkEntry(
             toolbar,
             textvariable=query_var,
@@ -825,6 +1184,23 @@ class SpotifyRecorderApp(ctk.CTk):
         search_entry.pack(side="left", fill="x", expand=True)
         count_label = ctk.CTkLabel(toolbar, text="")
         count_label.pack(side="right", padx=(10, 0))
+
+        filter_bar = ctk.CTkFrame(history_win, fg_color="transparent")
+        filter_bar.pack(fill="x", padx=18, pady=(0, 8))
+        ctk.CTkLabel(filter_bar, text="サービス").pack(side="left")
+        ctk.CTkSegmentedButton(
+            filter_bar,
+            values=["すべて", PROVIDER_SPOTIFY, PROVIDER_QOBUZ],
+            variable=provider_filter,
+            command=lambda _value: render(),
+        ).pack(side="left", padx=8)
+        ctk.CTkLabel(filter_bar, text="判定").pack(side="left", padx=(14, 0))
+        ctk.CTkSegmentedButton(
+            filter_bar,
+            values=["すべて", "合格", "要再録"],
+            variable=verdict_filter,
+            command=lambda _value: render(),
+        ).pack(side="left", padx=8)
 
         scroll = ctk.CTkScrollableFrame(history_win, fg_color="#11151a")
         scroll.pack(fill="both", expand=True, padx=18, pady=(0, 14))
@@ -836,6 +1212,25 @@ class SpotifyRecorderApp(ctk.CTk):
         def reveal_recording(path):
             if os.path.isfile(path):
                 subprocess.Popen(["open", "-R", path])
+
+        def preview_suspect(item):
+            if self.is_recording or not item.get("file_exists"):
+                return
+            events = (item.get("suspect_events") or {}).get("capture", [])
+            if not events:
+                return
+            start_sec = max(0.0, float(events[0].get("time_sec", 0.0)) - 2.0)
+            try:
+                with sf.SoundFile(item["file_path"]) as audio_file:
+                    audio_file.seek(int(start_sec * audio_file.samplerate))
+                    audio = audio_file.read(
+                        frames=int(8.0 * audio_file.samplerate),
+                        dtype="float32",
+                        always_2d=True,
+                    )
+                    sd.play(audio, audio_file.samplerate)
+            except Exception as exc:
+                self.log_message(f"疑義箇所の試聴エラー: {exc}")
 
         def suspect_lines(item):
             lines = []
@@ -853,7 +1248,22 @@ class SpotifyRecorderApp(ctk.CTk):
             for child in scroll.winfo_children():
                 child.destroy()
             try:
-                recordings = list_recordings(query_var.get(), database_path=self.catalog_path)
+                selected_provider = provider_filter.get()
+                selected_verdict = verdict_filter.get()
+                recordings = list_recordings(
+                    query_var.get(),
+                    database_path=self.catalog_path,
+                    provider=(
+                        selected_provider.lower()
+                        if selected_provider != "すべて"
+                        else None
+                    ),
+                    requires_rerecord=(
+                        True
+                        if selected_verdict == "要再録"
+                        else False if selected_verdict == "合格" else None
+                    ),
+                )
             except Exception as exc:
                 count_label.configure(text="読込エラー")
                 ctk.CTkLabel(scroll, text=str(exc), text_color="#ff5964").pack(pady=20)
@@ -872,7 +1282,7 @@ class SpotifyRecorderApp(ctk.CTk):
                     verdict = "ファイルなし"
                     verdict_color = "#808995"
                 elif item["quality_gate_pass"] == 1:
-                    verdict = "合格（実効Lossless未証明）"
+                    verdict = "合格（bit一致未証明）"
                     verdict_color = "#63f08f"
                 elif item["quality_gate_pass"] == 0:
                     verdict = "要確認"
@@ -889,10 +1299,12 @@ class SpotifyRecorderApp(ctk.CTk):
                 except (TypeError, ValueError):
                     saved_text = item["saved_at"]
                 details = (
+                    f"{item['provider'].title()} {item.get('source_mode') or '-'} / "
                     f"{saved_text} / {item['album']} / {item['duration_sec']:.1f}秒 / "
                     f"{item['sample_rate']}Hz / {item['integrated_lufs']:.2f} LUFS"
                     if item["integrated_lufs"] is not None
                     else (
+                        f"{item['provider'].title()} {item.get('source_mode') or '-'} / "
                         f"{saved_text} / {item['album']} / {item['duration_sec']:.1f}秒 / "
                         f"{item['sample_rate']}Hz"
                     )
@@ -932,6 +1344,19 @@ class SpotifyRecorderApp(ctk.CTk):
                     state=state,
                     command=lambda path=item["file_path"]: open_recording(path),
                 ).pack(side="left", padx=3)
+                preview_state = (
+                    "normal"
+                    if state == "normal" and suspect_lines(item) and not self.is_recording
+                    else "disabled"
+                )
+                ctk.CTkButton(
+                    button_frame,
+                    text="疑義試聴",
+                    width=70,
+                    height=26,
+                    state=preview_state,
+                    command=lambda target=item: preview_suspect(target),
+                ).pack(side="left", padx=3)
                 ctk.CTkButton(
                     button_frame,
                     text="Finder",
@@ -946,6 +1371,9 @@ class SpotifyRecorderApp(ctk.CTk):
         render()
 
     def on_processing_finished(self):
+        if self.pending_spool_audio is not None:
+            self.pending_spool_audio.close(delete=True)
+            self.pending_spool_audio = None
         def update():
             self.set_controls_recording(False)
             if getattr(self, "was_standby", False):
@@ -966,23 +1394,48 @@ class SpotifyRecorderApp(ctk.CTk):
 
         self.after(0, update)
 
-    def poll_spotify(self):
-        info = get_spotify_info_extended()
+    def poll_source(self):
+        adapter = self.current_adapter()
+        info = adapter.snapshot()
         self.current_spotify_info = info
+
+        if self.is_recording and self.capture_quality_audit is not None:
+            for event in adapter.poll_events():
+                event_type = event.get("type")
+                if event_type in {"source_buffering", "source_error"}:
+                    detail = event.get("message", f"{adapter.name}再生イベント")
+                    timestamp_epoch = event.get("timestamp_epoch")
+                    event_sample = None
+                    if timestamp_epoch is not None:
+                        event_sample = max(
+                            0,
+                            int(
+                                (float(timestamp_epoch) - self.capture_quality_audit.started_at)
+                                * self.sample_rate
+                            ),
+                        )
+                    self.capture_quality_audit.add_external_event(
+                        event_type,
+                        detail,
+                        sample=event_sample,
+                        duration_sec=event.get("duration_sec", 0.0),
+                    )
+                    self.log_message(f"品質疑義: {detail}")
 
         if info.get("status") == "OK":
             self.track_label.configure(text=info["name"], text_color="white")
             self.artist_label.configure(text=f"{info['artist']} - {info['album']} / {info['state']}", text_color="#b7bec8")
 
             if self.is_recording and self.capture_quality_audit is not None:
-                self.capture_quality_audit.observe_spotify_playback(
+                self.capture_quality_audit.observe_playback(
                     normalized_track_key(info),
                     info.get("state"),
                     info.get("position"),
+                    duration=info.get("duration"),
                 )
 
             if self.is_standby and not self.is_recording and info.get("state") == "playing":
-                self.log_message(f"Spotify再生検知: {info['artist']} - {info['name']}")
+                self.log_message(f"{adapter.name}再生検知: {info['artist']} - {info['name']}")
                 self.start_rec()
                 
             if self.is_recording:
@@ -997,43 +1450,69 @@ class SpotifyRecorderApp(ctk.CTk):
                     if self.spotify_idle_since is None:
                         self.spotify_idle_since = time.time()
                     elif time.time() - self.spotify_idle_since >= float(self.auto_stop_grace_sec.get()):
-                        self.log_message("Spotify自動停止検知")
+                        self.log_message(f"{adapter.name}自動停止検知")
                         self.stop_rec()
                 else:
                     self.spotify_idle_since = None
 
             if self.is_recording and info.get("state") == "playing":
+                if self.provider.get() == PROVIDER_QOBUZ:
+                    expected_rate = self.capture_quality_audit.source_evaluation.get(
+                        "source_sample_rate"
+                    )
+                    observed_rate = info.get("source_sample_rate")
+                    if expected_rate and observed_rate and int(expected_rate) != int(observed_rate):
+                        detail = (
+                            f"Qobuzソースレート変更: {expected_rate}Hz -> {observed_rate}Hz。"
+                            "1セッション1レート制約により停止します"
+                        )
+                        self.capture_quality_audit.add_external_event(
+                            "sample_rate_change", detail
+                        )
+                        self.log_message(f"品質重大エラー: {detail}")
+                        self.stop_rec()
+                        self.after(CHECK_INTERVAL_MS, self.poll_source)
+                        return
                 new_key = normalized_track_key(info)
                 if new_key and new_key != self.last_track_key:
                     estimated_start = self.estimate_track_start_sample(info)
                     self.add_history_track(info, estimated_start)
                     self.log_message(f"曲変更: {info['artist']} - {info['name']}")
 
-        elif info.get("status") in ("IDLE", "CLOSED"):
+        elif info.get("status") in ("IDLE", "CLOSED", "UNAVAILABLE"):
             if self.is_recording and self.capture_quality_audit is not None:
-                self.capture_quality_audit.observe_spotify_playback(None, "idle", None)
+                self.capture_quality_audit.observe_playback(None, "idle", None)
             if info.get("status") == "CLOSED":
-                self.track_label.configure(text="Spotify is closed", text_color="#b7bec8")
+                self.track_label.configure(text=f"{adapter.name} is closed", text_color="#b7bec8")
+            elif info.get("status") == "UNAVAILABLE":
+                self.track_label.configure(text=f"{adapter.name}: 証跡取得不能", text_color="#f0b429")
             else:
-                self.track_label.configure(text="Spotify is idle", text_color="#b7bec8")
+                self.track_label.configure(text=f"{adapter.name} is idle", text_color="#b7bec8")
             self.artist_label.configure(text="-", text_color="#b7bec8")
 
             if self.is_recording and self.auto_stop_on_idle.get():
                 if self.spotify_idle_since is None:
                     self.spotify_idle_since = time.time()
                 elif time.time() - self.spotify_idle_since >= float(self.auto_stop_grace_sec.get()):
-                    self.log_message("Spotify終了検知、録音停止")
+                    self.log_message(f"{adapter.name}終了検知、録音停止")
                     self.stop_rec()
 
-        self.after(CHECK_INTERVAL_MS, self.poll_spotify)
+        self.after(CHECK_INTERVAL_MS, self.poll_source)
 
     def on_closing(self):
         self.stop_audio_stream()
         if self.spotify_network_monitor is not None:
             self.spotify_network_monitor.stop()
+        if self.capture_spool is not None:
+            self.capture_spool.discard()
+        if self.pending_spool_audio is not None:
+            self.pending_spool_audio.close(delete=False)
         self.destroy()
 
 
 if __name__ == "__main__":
-    app = SpotifyRecorderApp()
+    app = HiResRecorderApp()
     app.mainloop()
+
+
+SpotifyRecorderApp = HiResRecorderApp

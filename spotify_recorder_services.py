@@ -6,7 +6,7 @@ from datetime import datetime
 import numpy as np
 import pyloudnorm as pyln
 import soundfile as sf
-from scipy.signal import resample_poly
+from scipy.signal import lfilter, resample_poly
 
 from mutagen.id3 import APIC, TALB, TIT2, TPE1, TXXX
 from mutagen.wave import WAVE
@@ -29,6 +29,9 @@ OUTPUT_FORMATS = [FORMAT_WAV]
 UNITY_GAIN = 1.0
 WAV_SUBTYPE = "FLOAT"
 TRUE_PEAK_OVERSAMPLE = 4
+ANALYSIS_CHUNK_FRAMES = 262144
+TRUE_PEAK_OVERLAP_FRAMES = 256
+RF64_DATA_THRESHOLD = 3_900_000_000
 
 
 def run_applescript(script, timeout=1.5):
@@ -235,7 +238,11 @@ def tag_wav(wav_path, track_info, artwork_bytes, analysis, capture_audit=None):
                 )
             )
         if capture_audit:
+            provider = str(capture_audit.get("provider", "spotify")).lower()
+            provider_label = "Qobuz" if provider == "qobuz" else "Spotify"
             settings = capture_audit.get("spotify_settings") or {}
+            source = capture_audit.get("source_evaluation") or {}
+            evidence = source.get("evidence") or {}
             network_test = capture_audit.get("network_test") or {}
             network = capture_audit.get("network_observation") or {}
             audio.tags.add(
@@ -249,32 +256,75 @@ def tag_wav(wav_path, track_info, artwork_bytes, analysis, capture_audit=None):
                 TXXX(
                     encoding=3,
                     desc="Lossless Verified",
-                    text="No - Spotify does not expose the effective playback codec",
+                    text=f"No - {provider_label} source bits were not available for comparison",
                 )
             )
+            audio.tags.add(TXXX(encoding=3, desc="Provider", text=provider_label))
             audio.tags.add(
                 TXXX(
                     encoding=3,
-                    desc="Spotify Quality Setting Raw",
-                    text=str(settings.get("streaming_quality_raw", "Unknown")),
+                    desc="Source Mode",
+                    text=str(source.get("mode", "streaming")),
                 )
             )
-            audio.tags.add(
-                TXXX(
-                    encoding=3,
-                    desc="Spotify Auto Downgrade",
-                    text=(
-                        "Disabled"
-                        if settings.get("auto_downgrade") is False
-                        else "Not verified"
-                    ),
+            if source.get("source_sample_rate"):
+                audio.tags.add(
+                    TXXX(
+                        encoding=3,
+                        desc="Source Sample Rate",
+                        text=str(source["source_sample_rate"]),
+                    )
                 )
-            )
+            if source.get("source_bit_depth"):
+                audio.tags.add(
+                    TXXX(
+                        encoding=3,
+                        desc="Source Bit Depth",
+                        text=str(source["source_bit_depth"]),
+                    )
+                )
+            if evidence.get("format_label"):
+                audio.tags.add(
+                    TXXX(
+                        encoding=3,
+                        desc="Source Format",
+                        text=str(evidence["format_label"]),
+                    )
+                )
+            if provider == "spotify":
+                audio.tags.add(
+                    TXXX(
+                        encoding=3,
+                        desc="Spotify Quality Setting Raw",
+                        text=str(settings.get("streaming_quality_raw", "Unknown")),
+                    )
+                )
+                audio.tags.add(
+                    TXXX(
+                        encoding=3,
+                        desc="Spotify Auto Downgrade",
+                        text=(
+                            "Disabled"
+                            if settings.get("auto_downgrade") is False
+                            else "Not verified"
+                        ),
+                    )
+                )
             audio.tags.add(
                 TXXX(
                     encoding=3,
                     desc="Audio Callback Anomalies",
                     text=str(capture_audit.get("callback_status_count", 0)),
+                )
+            )
+            audio.tags.add(
+                TXXX(
+                    encoding=3,
+                    desc="ADC Timeline Gaps",
+                    text=(
+                        f'{capture_audit.get("adc_timeline_gap_count", 0)} events / '
+                        f'max {capture_audit.get("max_adc_timeline_gap_sec", 0.0):.6f} sec'
+                    ),
                 )
             )
             audio.tags.add(
@@ -333,14 +383,14 @@ def tag_wav(wav_path, track_info, artwork_bytes, analysis, capture_audit=None):
                 audio.tags.add(
                     TXXX(
                         encoding=3,
-                        desc="Spotify Network Observed Bytes",
+                        desc=f"{provider_label} Network Observed Bytes",
                         text=str(network.get("inbound_total_bytes", 0)),
                     )
                 )
                 audio.tags.add(
                     TXXX(
                         encoding=3,
-                        desc="Spotify Network Average kbps",
+                        desc=f"{provider_label} Network Average kbps",
                         text=f'{network.get("inbound_average_kbps", 0.0):.2f}',
                     )
                 )
@@ -417,53 +467,160 @@ def true_ranges(mask, limit=20):
     return list(zip(starts, ends))[: int(limit)]
 
 
+def iter_audio_chunks(audio, start=0, end=None, chunk_frames=ANALYSIS_CHUNK_FRAMES):
+    stop = len(audio) if end is None else min(len(audio), int(end))
+    position = max(0, int(start))
+    while position < stop:
+        next_position = min(stop, position + int(chunk_frames))
+        yield position, np.asarray(audio[position:next_position], dtype=np.float32)
+        position = next_position
+
+
+def _integrated_loudness_chunked(audio, sample_rate):
+    if len(audio) < int(0.4 * sample_rate):
+        return None
+    meter = pyln.Meter(int(sample_rate))
+    channels = int(audio.shape[1])
+    states = {}
+    for name, stage in meter._filters.items():
+        state_length = max(len(stage.a), len(stage.b)) - 1
+        states[name] = np.zeros((state_length, channels), dtype=np.float64)
+
+    block_frames = int(meter.block_size * sample_rate)
+    hop_frames = int(block_frames * (1.0 - meter.overlap))
+    pending = np.empty((0, channels), dtype=np.float64)
+    energies = []
+    for _position, source in iter_audio_chunks(audio):
+        filtered = source.astype(np.float64, copy=True)
+        for name, stage in meter._filters.items():
+            next_filtered = np.empty_like(filtered)
+            for channel in range(channels):
+                next_filtered[:, channel], states[name][:, channel] = lfilter(
+                    stage.b,
+                    stage.a,
+                    filtered[:, channel],
+                    zi=states[name][:, channel],
+                )
+            filtered = next_filtered
+        pending = np.concatenate((pending, filtered), axis=0)
+        while len(pending) >= block_frames:
+            block = pending[:block_frames]
+            energies.append(np.mean(np.square(block), axis=0))
+            pending = pending[hop_frames:]
+
+    if not energies:
+        return None
+    values = np.asarray(energies, dtype=np.float64)
+    gains = np.asarray([1.0, 1.0, 1.0, 1.41, 1.41][:channels])
+    weighted_power = values @ gains
+    with np.errstate(divide="ignore"):
+        loudness = -0.691 + 10.0 * np.log10(weighted_power)
+    absolute = loudness >= -70.0
+    if not np.any(absolute):
+        return None
+    absolute_mean = np.mean(values[absolute], axis=0)
+    with np.errstate(divide="ignore"):
+        relative_gate = -0.691 + 10.0 * np.log10(np.sum(gains * absolute_mean)) - 10.0
+    gated = (loudness > -70.0) & (loudness > relative_gate)
+    if not np.any(gated):
+        return None
+    final_power = float(np.sum(gains * np.mean(values[gated], axis=0)))
+    measured = dbfs(np.sqrt(final_power)) - 0.691
+    return measured if np.isfinite(measured) else None
+
+
+def _true_peak_chunked(audio, sample_rate):
+    best_peak = 0.0
+    best_time = 0.0
+    total = len(audio)
+    for start in range(0, total, ANALYSIS_CHUNK_FRAMES):
+        end = min(total, start + ANALYSIS_CHUNK_FRAMES)
+        context_start = max(0, start - TRUE_PEAK_OVERLAP_FRAMES)
+        context_end = min(total, end + TRUE_PEAK_OVERLAP_FRAMES)
+        context = np.asarray(audio[context_start:context_end], dtype=np.float64)
+        oversampled = resample_poly(context, TRUE_PEAK_OVERSAMPLE, 1, axis=0)
+        local_start = (start - context_start) * TRUE_PEAK_OVERSAMPLE
+        local_end = local_start + (end - start) * TRUE_PEAK_OVERSAMPLE
+        central = np.abs(oversampled[local_start:local_end])
+        if central.size == 0:
+            continue
+        flat_index = int(np.argmax(central))
+        peak = float(central.flat[flat_index])
+        if peak > best_peak:
+            frame_index = flat_index // central.shape[1]
+            best_peak = peak
+            best_time = (start * TRUE_PEAK_OVERSAMPLE + frame_index) / (
+                sample_rate * TRUE_PEAK_OVERSAMPLE
+            )
+    return best_peak, best_time
+
+
 def analyze_audio(audio, sample_rate):
-    samples = np.asarray(audio, dtype=np.float32)
-    if samples.ndim == 1:
-        samples = samples[:, np.newaxis]
-    if samples.ndim != 2 or len(samples) == 0:
+    shape = getattr(audio, "shape", None)
+    if shape is None:
+        audio = np.asarray(audio, dtype=np.float32)
+        shape = audio.shape
+    if len(shape) == 1:
+        audio = np.asarray(audio, dtype=np.float32)[:, np.newaxis]
+        shape = audio.shape
+    if len(shape) != 2 or len(audio) == 0:
         raise ValueError("音声データが空、または不正な形状です")
-    if not np.isfinite(samples).all():
-        raise ValueError("音声データにNaNまたはInfが含まれています")
+    channels = int(shape[1])
+    sample_peak = 0.0
+    sample_peak_frame = 0
+    full_scale_sample_count = 0
+    full_scale_frame_count = 0
+    longest_full_scale_run = 0
+    current_run = 0
+    range_start = None
+    full_scale_ranges = []
+    for position, chunk in iter_audio_chunks(audio):
+        if not np.isfinite(chunk).all():
+            raise ValueError("音声データにNaNまたはInfが含まれています")
+        absolute = np.abs(chunk)
+        local_peak_index = int(np.argmax(absolute))
+        local_peak = float(absolute.flat[local_peak_index])
+        if local_peak > sample_peak:
+            sample_peak = local_peak
+            sample_peak_frame = position + local_peak_index // channels
+        full_mask = absolute >= 1.0
+        frame_mask = np.any(full_mask, axis=1)
+        full_scale_sample_count += int(np.count_nonzero(full_mask))
+        full_scale_frame_count += int(np.count_nonzero(frame_mask))
+        for offset, active in enumerate(frame_mask):
+            frame = position + offset
+            if active:
+                if range_start is None:
+                    range_start = frame
+                current_run += 1
+                longest_full_scale_run = max(longest_full_scale_run, current_run)
+            else:
+                if range_start is not None and len(full_scale_ranges) < 20:
+                    full_scale_ranges.append((range_start, frame))
+                range_start = None
+                current_run = 0
+    if range_start is not None and len(full_scale_ranges) < 20:
+        full_scale_ranges.append((range_start, len(audio)))
 
-    absolute = np.abs(samples)
-    sample_peak = float(np.max(absolute))
-    sample_peak_flat_index = int(np.argmax(absolute))
-    sample_peak_frame = sample_peak_flat_index // samples.shape[1]
-    full_scale_mask = absolute >= 1.0
-    full_scale_frames = np.any(full_scale_mask, axis=1)
-
-    oversampled = resample_poly(
-        samples.astype(np.float64, copy=False),
-        TRUE_PEAK_OVERSAMPLE,
-        1,
-        axis=0,
-    )
-    true_peak = float(np.max(np.abs(oversampled)))
-    true_peak_flat_index = int(np.argmax(np.abs(oversampled)))
-    true_peak_frame = true_peak_flat_index // samples.shape[1]
-
-    integrated_lufs = None
+    true_peak, true_peak_time = _true_peak_chunked(audio, int(sample_rate))
     try:
-        measured = float(pyln.Meter(int(sample_rate)).integrated_loudness(samples))
-        if np.isfinite(measured):
-            integrated_lufs = measured
+        integrated_lufs = _integrated_loudness_chunked(audio, int(sample_rate))
     except (ValueError, ZeroDivisionError):
-        pass
+        integrated_lufs = None
 
     sample_peak_dbfs = dbfs(sample_peak)
     true_peak_dbtp = dbfs(true_peak)
     warnings = []
     if sample_peak > 1.0:
         warnings.append("入力値が0 dBFSを超えています")
-    elif np.any(full_scale_mask):
+    elif full_scale_sample_count:
         warnings.append("0 dBFS到達サンプルがあります")
     if true_peak_dbtp > 0.0:
         warnings.append("True Peakが0 dBTPを超えています")
 
     return {
         "sample_rate": int(sample_rate),
-        "channels": int(samples.shape[1]),
+        "channels": channels,
         "integrated_lufs": integrated_lufs,
         "sample_peak": sample_peak,
         "sample_peak_dbfs": sample_peak_dbfs,
@@ -471,11 +628,11 @@ def analyze_audio(audio, sample_rate):
         "sample_peak_time_sec": sample_peak_frame / sample_rate,
         "true_peak": true_peak,
         "true_peak_dbtp": true_peak_dbtp,
-        "true_peak_time_sec": true_peak_frame / (sample_rate * TRUE_PEAK_OVERSAMPLE),
+        "true_peak_time_sec": true_peak_time,
         "headroom_db": -sample_peak_dbfs,
-        "full_scale_sample_count": int(np.count_nonzero(full_scale_mask)),
-        "full_scale_frame_count": int(np.count_nonzero(full_scale_frames)),
-        "longest_full_scale_run": int(longest_true_run(full_scale_frames)),
+        "full_scale_sample_count": full_scale_sample_count,
+        "full_scale_frame_count": full_scale_frame_count,
+        "longest_full_scale_run": longest_full_scale_run,
         "full_scale_ranges": [
             {
                 "start_frame": int(start),
@@ -483,7 +640,7 @@ def analyze_audio(audio, sample_rate):
                 "start_sec": start / sample_rate,
                 "end_sec": end / sample_rate,
             }
-            for start, end in true_ranges(full_scale_frames)
+            for start, end in full_scale_ranges
         ],
         "warnings": warnings,
     }
@@ -533,15 +690,21 @@ def trim_silence(audio, sample_rate, threshold_db, pad_start_sec, pad_end_sec):
     if len(audio) == 0:
         return audio, 0, 0
     threshold = 10 ** (threshold_db / 20.0)
-    amplitude = np.max(np.abs(audio), axis=1)
-    active = np.where(amplitude > threshold)[0]
-    if len(active) == 0:
+    first_active = None
+    last_active = None
+    for position, chunk in iter_audio_chunks(audio):
+        active = np.where(np.max(np.abs(chunk), axis=1) > threshold)[0]
+        if len(active):
+            if first_active is None:
+                first_active = position + int(active[0])
+            last_active = position + int(active[-1])
+    if first_active is None or last_active is None:
         return audio, 0, len(audio)
 
     pad_start = int(pad_start_sec * sample_rate)
     pad_end = int(pad_end_sec * sample_rate)
-    start = max(0, active[0] - pad_start)
-    end = min(len(audio), active[-1] + pad_end)
+    start = max(0, first_active - pad_start)
+    end = min(len(audio), last_active + pad_end + 1)
     return audio[start:end], start, end
 
 def find_silence_split(audio, approx_sample, sample_rate, threshold_db, log_callback, track_name):
@@ -712,7 +875,7 @@ def process_and_save_candidates(candidates, options, log_callback, on_finish):
             segment = cand["segment_audio"]
             trim_start = cand["trim_start"]
             trim_end = cand["trim_end"]
-            trimmed = np.asarray(segment[trim_start:trim_end], dtype=np.float32)
+            trimmed = segment[trim_start:trim_end]
             if len(trimmed) == 0:
                 continue
 
@@ -732,19 +895,28 @@ def process_and_save_candidates(candidates, options, log_callback, on_finish):
                 )
                 final_path = unique_path(save_dir, filename)
 
-                # Unity Gain: float32 samples are written without scaling, limiting, or clipping.
-                sf.write(
+                data_bytes = len(trimmed) * int(trimmed.shape[1]) * 4
+                container = "RF64" if data_bytes >= RF64_DATA_THRESHOLD else "WAV"
+                with sf.SoundFile(
                     final_path,
-                    trimmed,
-                    int(sample_rate),
-                    format="WAV",
+                    mode="w",
+                    samplerate=int(sample_rate),
+                    channels=int(trimmed.shape[1]),
+                    format=container,
                     subtype=WAV_SUBTYPE,
-                )
+                ) as output:
+                    for _position, chunk in iter_audio_chunks(trimmed):
+                        output.write(chunk)
 
                 artwork_bytes = None
                 if track.get("artwork_url"):
                     artwork_bytes = download_url_bytes(track["artwork_url"])
-                tag_wav(final_path, track, artwork_bytes, analysis, file_audit)
+                if container == "WAV":
+                    tag_wav(final_path, track, artwork_bytes, analysis, file_audit)
+                else:
+                    log_callback(
+                        f"RF64タグ制限: {os.path.basename(final_path)} / メタデータは録音履歴DBを正本にします"
+                    )
 
                 if catalog_path:
                     try:
@@ -762,7 +934,9 @@ def process_and_save_candidates(candidates, options, log_callback, on_finish):
                             f"録音履歴エラー: {os.path.basename(final_path)} / {exc}"
                         )
 
-                log_callback(f"保存: {os.path.basename(final_path)} / {format_analysis(analysis)}")
+                log_callback(
+                    f"保存: {os.path.basename(final_path)} / {container} FLOAT / {format_analysis(analysis)}"
+                )
                 for warning in analysis["warnings"]:
                     log_callback(f"品質警告: {os.path.basename(final_path)} / {warning}")
                 saved += 1

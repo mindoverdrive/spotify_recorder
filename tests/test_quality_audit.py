@@ -160,6 +160,20 @@ class CaptureAuditTests(unittest.TestCase):
         self.assertEqual(result["boundary_discontinuities"], 1)
         self.assertFalse(result["quality_gate_pass"])
 
+    def test_detects_adc_timeline_gap_at_callback_boundary(self):
+        audio = np.full((4410, 2), 0.1, dtype=np.float32)
+        with patch("spotify_quality_audit.time.time", side_effect=[1000.0, 1001.0]), patch(
+            "spotify_quality_audit.time.monotonic", side_effect=[100.0, 101.0]
+        ):
+            audit = CaptureQualityAudit(44100, "BlackHole", GOOD_SETTINGS)
+            audit.record_audio_callback(4410, samples=audio, adc_time=10.0)
+            audit.record_audio_callback(4410, samples=audio * 0.9, adc_time=10.12)
+            result = audit.finish()
+
+        self.assertEqual(result["adc_timeline_gap_count"], 1)
+        self.assertTrue(any(event["type"] == "adc_timeline_gap" for event in result["events"]))
+        self.assertFalse(result["quality_gate_pass"])
+
 
 if __name__ == "__main__":
     unittest.main()

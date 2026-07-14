@@ -12,6 +12,7 @@ import numpy as np
 
 SPOTIFY_LOSSLESS_ENUM_CANDIDATE = 5
 SPOTIFY_RECOMMENDED_MIN_MBPS = 2.0
+QOBUZ_RECOMMENDED_MIN_MBPS = 10.0
 NETWORK_TEST_FRESHNESS_SEC = 30 * 60
 
 
@@ -129,16 +130,21 @@ def format_spotify_quality_settings(settings):
     )
 
 
-def parse_network_quality_output(output, measured_at=None):
+def parse_network_quality_output(
+    output,
+    measured_at=None,
+    minimum_mbps=SPOTIFY_RECOMMENDED_MIN_MBPS,
+    provider_label="Spotify",
+):
     payload = json.loads(output)
     throughput_bps = float(payload.get("dl_throughput", 0.0))
     download_mbps = throughput_bps / 1_000_000.0
     base_rtt = payload.get("base_rtt")
     interface_name = payload.get("interface_name")
     warnings = []
-    if download_mbps < SPOTIFY_RECOMMENDED_MIN_MBPS:
+    if download_mbps < float(minimum_mbps):
         warnings.append(
-            f"下り実測がSpotify推奨下限{SPOTIFY_RECOMMENDED_MIN_MBPS:.1f} Mbps未満です"
+            f"下り実測が{provider_label}推奨下限{float(minimum_mbps):.1f} Mbps未満です"
         )
     if interface_name and str(interface_name).startswith("utun"):
         warnings.append("VPN/トンネル経由の測定です")
@@ -149,12 +155,18 @@ def parse_network_quality_output(output, measured_at=None):
         "base_rtt_ms": None if base_rtt is None else float(base_rtt),
         "interface_name": interface_name,
         "endpoint": payload.get("test_endpoint"),
-        "pass": download_mbps >= SPOTIFY_RECOMMENDED_MIN_MBPS,
+        "pass": download_mbps >= float(minimum_mbps),
+        "minimum_mbps": float(minimum_mbps),
+        "provider": str(provider_label).lower(),
         "warnings": warnings,
     }
 
 
-def run_network_quality_test(max_runtime=15):
+def run_network_quality_test(
+    max_runtime=15,
+    minimum_mbps=SPOTIFY_RECOMMENDED_MIN_MBPS,
+    provider_label="Spotify",
+):
     executable = shutil.which("networkQuality")
     if not executable:
         return {"available": False, "error": "networkQualityコマンドがありません"}
@@ -173,7 +185,11 @@ def run_network_quality_test(max_runtime=15):
             "error": result.stderr.strip() or f"networkQuality終了コード: {result.returncode}",
         }
     try:
-        return parse_network_quality_output(result.stdout)
+        return parse_network_quality_output(
+            result.stdout,
+            minimum_mbps=minimum_mbps,
+            provider_label=provider_label,
+        )
     except (ValueError, TypeError, json.JSONDecodeError) as exc:
         return {"available": False, "error": f"回線実測結果を解析できません: {exc}"}
 
@@ -197,8 +213,10 @@ def format_network_quality(result):
     )
 
 
-class SpotifyNetworkMonitor:
-    def __init__(self, interval_sec=2.0):
+class ProcessNetworkMonitor:
+    def __init__(self, process_prefixes=("spotify",), provider_label="Spotify", interval_sec=2.0):
+        self.process_prefixes = tuple(str(value).lower() for value in process_prefixes)
+        self.provider_label = str(provider_label)
         self.interval_sec = float(interval_sec)
         self._lock = threading.Lock()
         self._process = None
@@ -242,12 +260,11 @@ class SpotifyNetworkMonitor:
         self._thread.start()
         return True
 
-    @staticmethod
-    def _is_spotify_process(process_name):
+    def _is_target_process(self, process_name):
         base_name, separator, pid = process_name.rpartition(".")
         if separator and pid.isdigit():
             process_name = base_name
-        return process_name.lower().startswith("spotify")
+        return process_name.lower().startswith(self.process_prefixes)
 
     def _read_output(self):
         assert self._process is not None
@@ -269,7 +286,7 @@ class SpotifyNetworkMonitor:
                 if not self._saw_header or len(row) < 3:
                     continue
                 process_name = row[0].strip()
-                if not self._is_spotify_process(process_name):
+                if not self._is_target_process(process_name):
                     continue
                 try:
                     self._current_snapshot[process_name] = int(row[1])
@@ -292,6 +309,7 @@ class SpotifyNetworkMonitor:
                     {
                         "elapsed_sec": elapsed,
                         "bytes_in": delta_bytes,
+                        "target_process_seen": bool(snapshot),
                         "spotify_process_seen": bool(snapshot),
                     }
                 )
@@ -321,12 +339,14 @@ class SpotifyNetworkMonitor:
             sample["bytes_in"] * 8.0 / sample["elapsed_sec"] / 1000.0
             for sample in samples
         ]
-        observed = sum(1 for sample in samples if sample["spotify_process_seen"])
+        observed = sum(1 for sample in samples if sample["target_process_seen"])
         notes = [
-            "Spotify通信量はバッファ/キャッシュの影響を受け、実効コーデックの証明には使えません"
+            f"{self.provider_label}通信量はバッファ/キャッシュの影響を受け、実効コーデックの証明には使えません"
         ]
         if self._started and observed == 0:
-            notes.append("Spotify通信を観測できませんでした（オフライン/キャッシュ再生の可能性を含む）")
+            notes.append(
+                f"{self.provider_label}通信を観測できませんでした（オフライン/キャッシュ再生の可能性を含む）"
+            )
         return {
             "available": self._started and self._error is None,
             "error": self._error,
@@ -341,10 +361,16 @@ class SpotifyNetworkMonitor:
             "zero_transfer_intervals": sum(
                 1
                 for sample in samples
-                if sample["spotify_process_seen"] and sample["bytes_in"] == 0
+                if sample["target_process_seen"] and sample["bytes_in"] == 0
             ),
             "notes": notes,
+            "provider": self.provider_label.lower(),
         }
+
+
+class SpotifyNetworkMonitor(ProcessNetworkMonitor):
+    def __init__(self, interval_sec=2.0):
+        super().__init__(("spotify",), "Spotify", interval_sec)
 
 
 class CaptureQualityAudit:
@@ -355,10 +381,15 @@ class CaptureQualityAudit:
         spotify_settings,
         network_test=None,
         recording_frame_offset=0,
+        provider="spotify",
+        source_evaluation=None,
     ):
         self.sample_rate = int(sample_rate)
         self.device_name = str(device_name)
         self.spotify_settings = dict(spotify_settings)
+        self.provider = str(provider).lower()
+        self.provider_label = "Qobuz" if self.provider == "qobuz" else "Spotify"
+        self.source_evaluation = dict(source_evaluation or {})
         self.network_test = dict(network_test) if network_test else None
         self.recording_frame_offset = max(0, int(recording_frame_offset))
         self.started_at = time.time()
@@ -367,6 +398,9 @@ class CaptureQualityAudit:
         self._callback_frames = 0
         self._callback_status_count = 0
         self._callback_status_examples = []
+        self._last_adc_time = None
+        self._last_adc_frames = None
+        self._adc_timeline_gaps = []
         self._last_audio_probe = None
         self._last_audio_frame = None
         self._current_zero_frames = 0
@@ -376,7 +410,7 @@ class CaptureQualityAudit:
         self._boundary_discontinuities = 0
         self._max_boundary_jump = 0.0
         self._last_playback_observation = None
-        self._spotify_playing = None
+        self._source_playing = None
         self._playback_stall_durations = []
         self._timeline_slips = []
         self._events = []
@@ -399,10 +433,28 @@ class CaptureQualityAudit:
             event["value_sec"] = float(value_sec)
         self._events.append(event)
 
-    def record_audio_callback(self, frames, status=None, samples=None):
+    def record_audio_callback(self, frames, status=None, samples=None, adc_time=None):
         with self._lock:
             self._callback_frames += int(frames)
             block_start_frame = self._callback_frames - int(frames)
+            try:
+                adc_value = float(adc_time) if adc_time is not None else None
+            except (TypeError, ValueError):
+                adc_value = None
+            if adc_value and self._last_adc_time is not None and self._last_adc_frames:
+                expected_delta = self._last_adc_frames / self.sample_rate
+                timeline_gap = adc_value - self._last_adc_time - expected_delta
+                if abs(timeline_gap) > max(0.0005, 2.0 / self.sample_rate):
+                    self._adc_timeline_gaps.append(timeline_gap)
+                    self._add_event_locked(
+                        "adc_timeline_gap",
+                        block_start_frame,
+                        f"ADCタイムラインのgap/overlap疑い: {timeline_gap:+.6f}秒",
+                        value_sec=timeline_gap,
+                    )
+            if adc_value:
+                self._last_adc_time = adc_value
+                self._last_adc_frames = int(frames)
             if status:
                 self._callback_status_count += 1
                 text = str(status)
@@ -418,7 +470,7 @@ class CaptureQualityAudit:
             block = np.asarray(samples)
             if block.ndim != 2 or len(block) == 0:
                 return
-            if self._spotify_playing is False:
+            if self._source_playing is False:
                 self._current_zero_frames = 0
                 self._last_audio_probe = None
                 self._last_audio_frame = None
@@ -472,7 +524,14 @@ class CaptureQualityAudit:
                     )
             self._last_audio_frame = np.asarray(block[-1], dtype=np.float64).copy()
 
-    def observe_spotify_playback(self, track_key, state, position, observed_monotonic=None):
+    def observe_playback(
+        self,
+        track_key,
+        state,
+        position,
+        observed_monotonic=None,
+        duration=None,
+    ):
         now = time.monotonic() if observed_monotonic is None else float(observed_monotonic)
         try:
             position = float(position)
@@ -480,14 +539,14 @@ class CaptureQualityAudit:
             position = None
         with self._lock:
             if state != "playing" or position is None or track_key is None:
-                self._spotify_playing = False
+                self._source_playing = False
                 self._last_playback_observation = None
                 self._current_zero_frames = 0
                 self._current_zero_start_frame = None
                 self._last_audio_probe = None
                 self._last_audio_frame = None
                 return
-            self._spotify_playing = True
+            self._source_playing = True
             current = {
                 "track_key": track_key,
                 "position": position,
@@ -511,18 +570,31 @@ class CaptureQualityAudit:
                 self._add_event_locked(
                     "playback_stall",
                     current["callback_frames"],
-                    f"Spotify再生位置の停止疑い: {stall_duration:.2f}秒",
+                    f"{self.provider_label}再生位置の停止疑い: {stall_duration:.2f}秒",
                     stall_duration,
                 )
             timeline_slip = capture_delta - position_delta
-            if abs(timeline_slip) >= 0.75:
+            try:
+                duration_value = max(0.0, float(duration or 0.0))
+            except (TypeError, ValueError):
+                duration_value = 0.0
+            slip_threshold = max(0.25, duration_value * 0.001)
+            if abs(timeline_slip) >= slip_threshold:
                 self._timeline_slips.append(timeline_slip)
                 self._add_event_locked(
                     "timeline_slip",
                     current["callback_frames"],
-                    f"録音とSpotifyタイムラインの滑り疑い: {timeline_slip:+.2f}秒",
+                    f"録音と{self.provider_label}タイムラインの滑り疑い: {timeline_slip:+.2f}秒",
                     value_sec=timeline_slip,
                 )
+
+    def observe_spotify_playback(self, track_key, state, position, observed_monotonic=None):
+        self.observe_playback(track_key, state, position, observed_monotonic)
+
+    def add_external_event(self, event_type, detail, sample=None, duration_sec=0.0):
+        with self._lock:
+            target = self._callback_frames if sample is None else int(sample)
+            self._add_event_locked(event_type, target, detail, duration_sec)
 
     def finish(self, network_summary=None, ended_at=None, ended_monotonic=None):
         ended_at = time.time() if ended_at is None else float(ended_at)
@@ -532,6 +604,7 @@ class CaptureQualityAudit:
             callback_frames = self._callback_frames
             callback_status_count = self._callback_status_count
             callback_status_examples = list(self._callback_status_examples)
+            adc_timeline_gaps = list(self._adc_timeline_gaps)
             zero_ranges = list(self._digital_zero_ranges)
             if self._current_zero_frames and self._current_zero_start_frame is not None:
                 zero_ranges.append(
@@ -549,14 +622,31 @@ class CaptureQualityAudit:
         captured_sec = callback_frames / self.sample_rate if self.sample_rate else 0.0
         deficit_sec = max(0.0, elapsed - captured_sec)
         deficit_limit = max(0.75, elapsed * 0.02)
-        settings_evaluation = evaluate_spotify_quality_settings(self.spotify_settings)
+        settings_evaluation = (
+            dict(self.source_evaluation)
+            if self.provider == "qobuz"
+            else evaluate_spotify_quality_settings(self.spotify_settings)
+        )
+        settings_evaluation.setdefault("warnings", [])
+        settings_evaluation.setdefault("notes", [])
+        settings_evaluation.setdefault("conditions_pass", False)
         warnings = list(settings_evaluation["warnings"])
         notes = list(settings_evaluation["notes"])
 
-        if self.sample_rate != 44100:
+        expected_rate = settings_evaluation.get("source_sample_rate")
+        if expected_rate and self.sample_rate != int(expected_rate):
+            warnings.append(
+                f"入力サンプルレートがソースと一致しません: "
+                f"入力{self.sample_rate}Hz / ソース{int(expected_rate)}Hz"
+            )
+        elif self.provider == "spotify" and self.sample_rate != 44100:
             warnings.append(f"入力サンプルレートが44.1kHzではありません: {self.sample_rate}Hz")
         if callback_status_count:
             warnings.append(f"音声コールバック異常を{callback_status_count}回検出しました")
+        if adc_timeline_gaps:
+            warnings.append(
+                f"ADCタイムラインのgap/overlapを{len(adc_timeline_gaps)}回検出しました"
+            )
         if deficit_sec > deficit_limit:
             warnings.append(f"録音時間に対して約{deficit_sec:.2f}秒のフレーム不足があります")
 
@@ -589,12 +679,21 @@ class CaptureQualityAudit:
         playback_stall_sec = sum(playback_stall_durations)
         if playback_stall_sec >= 0.75:
             warnings.append(
-                f"Spotify再生位置の停止疑いを{len(playback_stall_durations)}回 / "
+                f"{self.provider_label}再生位置の停止疑いを{len(playback_stall_durations)}回 / "
                 f"約{playback_stall_sec:.2f}秒検出しました"
             )
         if timeline_slips:
             warnings.append(
-                f"録音とSpotifyタイムラインの滑り疑いを{len(timeline_slips)}回検出しました"
+                f"録音と{self.provider_label}タイムラインの滑り疑いを{len(timeline_slips)}回検出しました"
+            )
+        source_problem_events = [
+            event
+            for event in events
+            if event.get("type") in {"source_buffering", "source_error", "sample_rate_change", "spool_overflow"}
+        ]
+        if source_problem_events:
+            warnings.append(
+                f"{self.provider_label}再生/録音経路の重大イベントを{len(source_problem_events)}件検出しました"
             )
 
         if not self.network_test:
@@ -606,7 +705,7 @@ class CaptureQualityAudit:
 
         network = dict(network_summary or {})
         if network.get("error"):
-            notes.append(f"Spotify通信監視エラー: {network['error']}")
+            notes.append(f"{self.provider_label}通信監視エラー: {network['error']}")
         notes.extend(network.get("notes", []))
 
         quality_gate_pass = not warnings
@@ -618,13 +717,19 @@ class CaptureQualityAudit:
             "ended_at": ended_at,
             "sample_rate": self.sample_rate,
             "device_name": self.device_name,
+            "provider": self.provider,
             "spotify_settings": self.spotify_settings,
+            "source_evaluation": settings_evaluation,
             "settings_evaluation": settings_evaluation,
             "network_test": self.network_test,
             "network_observation": network,
             "callback_frames": callback_frames,
             "callback_status_count": callback_status_count,
             "callback_status_examples": callback_status_examples,
+            "adc_timeline_gap_count": len(adc_timeline_gaps),
+            "max_adc_timeline_gap_sec": max(
+                (abs(value) for value in adc_timeline_gaps), default=0.0
+            ),
             "capture_elapsed_sec": elapsed,
             "captured_callback_sec": captured_sec,
             "frame_deficit_sec": deficit_sec,
@@ -641,9 +746,13 @@ class CaptureQualityAudit:
             "quality_gate_pass": quality_gate_pass,
             "lossless_verified": False,
             "assurance_label": (
-                "Lossless条件適合・実効品質は未証明"
-                if quality_gate_pass
-                else "品質条件に要確認・実効Lossless未証明"
+                settings_evaluation.get("assurance_label")
+                if quality_gate_pass and settings_evaluation.get("assurance_label")
+                else (
+                    f"{self.provider_label}品質条件適合・bit一致未証明"
+                    if quality_gate_pass
+                    else f"品質条件に要確認・{self.provider_label} bit一致未証明"
+                )
             ),
             "warnings": warnings,
             "notes": list(dict.fromkeys(notes)),
@@ -654,15 +763,16 @@ def format_capture_audit(audit):
     if not audit:
         return "ソース監査なし"
     network = audit.get("network_observation") or {}
-    network_text = "Spotify通信未観測"
+    provider_label = "Qobuz" if audit.get("provider") == "qobuz" else "Spotify"
+    network_text = f"{provider_label}通信未観測"
     if network.get("sample_count"):
         total_mb = network.get("inbound_total_bytes", 0) / 1_000_000.0
         network_text = (
-            f"Spotify受信 {total_mb:.1f} MB / 平均 {network.get('inbound_average_kbps', 0):.0f} kbps"
+            f"{provider_label}受信 {total_mb:.1f} MB / 平均 {network.get('inbound_average_kbps', 0):.0f} kbps"
         )
     return (
         f"{audit.get('assurance_label', '監査不明')} / "
-        f"音声異常 {audit.get('callback_status_count', 0)} / "
+        f"音声異常 {audit.get('callback_status_count', 0) + audit.get('adc_timeline_gap_count', 0)} / "
         f"停止疑い {audit.get('playback_stall_count', 0)} / "
         f"滑り疑い {audit.get('timeline_slip_count', 0)} / {network_text}"
     )
@@ -766,5 +876,8 @@ def audit_for_audio_range(audit, start_sample, end_sample):
     )
     scoped["callback_status_count"] = sum(
         1 for event in scoped_events if event.get("type") == "audio_callback"
+    )
+    scoped["adc_timeline_gap_count"] = sum(
+        1 for event in scoped_events if event.get("type") == "adc_timeline_gap"
     )
     return scoped
