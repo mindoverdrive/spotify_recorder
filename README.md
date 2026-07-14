@@ -1,6 +1,9 @@
 # Hi-Res Recorder
 
+Mac用です。HiResRecorder.specでinstallして下さい。
 Spotify/Qobuz Desktopの出力をUnity Gainの32-bit float WAVとして保存し、録音品質と疑義箇所を管理するmacOSアプリです。Native版を正式系とし、Nextは既存の実験版として残しています。
+*俺の環境ではLoop Back(仮想チャンネルソフト)を使ってるので、デフォルトの入力チャンネルが5,6chステレオになってます。これを1,2chにするとOS通知音とか入っちゃうよ！
+通知音をoffにするなり、あんたの環境に合わせてカスタマイズしてくれ。-> CodexにこのURL投げちゃえ！！
 
 ## 録音品質
 
