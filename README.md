@@ -1,9 +1,8 @@
 # Hi-Res Recorder
 
-Mac用です。HiResRecorder.specでinstallして下さい。
-Spotify/Qobuz Desktopの出力をUnity Gainの32-bit float WAVとして保存し、録音品質と疑義箇所を管理するmacOSアプリです。Native版を正式系とし、Nextは既存の実験版として残しています。
-⚠️俺の環境ではLoop Back(有料の仮想チャンネルソフト)を使ってるので、デフォルトの入力チャンネルが5,6chステレオになってます。これを1,2chにするとOS通知音とか、他のアプリのノイズが入っちゃうよ！ -> 無料ソフトのBlackHoleとか使って、専用のチャンネルを用意したほうがいいっす⚠️
-あとは、あんたの環境に合わせてカスタマイズしてくれ。（仮想チャンネルを使わないといろんなアプリが1,2chに入力されてノイズが乗ります。。）-> CodexにこのURL投げちゃえ！！
+Spotify/Qobuz Desktopの出力を、アプリ内で音量を変えずに32-bit float WAVとして記録し、録音品質と疑義箇所を管理するmacOSアプリです。Native版が正式系で、Nextは実験用プロトタイプとして残しています。
+
+録音には、音楽アプリ専用の仮想オーディオ経路を使います。LoopbackはRogue Amoeba製の有料ルーティングアプリ、BlackHoleは無料で使える仮想オーディオドライバです。Macの通常の入力1/2chを直接録音すると、通知音やブラウザなど他アプリの音が混ざる可能性があります。専用の2ch経路を用意し、SpotifyまたはQobuzだけをそこへ出力してください。
 
 ## 録音品質
 
@@ -14,6 +13,45 @@ Spotify/Qobuz Desktopの出力をUnity Gainの32-bit float WAVとして保存し
 - Integrated LUFS、Sample Peak、4倍True Peak、0dBFS到達位置をチャンク解析
 - PortAudio異常、フレーム不足、0.5秒以上の無音、同一ブロック反復、境界不連続、再生停止、タイムライン滑りを記録
 - 音声波形や通信量だけからLosslessを断定せず、常に「bit一致未証明」と表示
+
+## 初めて使う人へ
+
+このアプリは開発途中です。配布済みアプリをダブルクリックするだけで完結する段階ではなく、Macのオーディオ経路、Python環境、録音アプリのビルドを設定する必要があります。音楽ファイルの権利と各サービスの利用規約を守れるコンテンツだけを対象にしてください。
+
+### いちばん現実的な方法: Codexなどのコーディングエージェントに任せる
+
+このリポジトリのURLと次の依頼文をコーディングエージェントに渡してください。Macの構成は人によって異なるため、手順を丸写しするより、実際のデバイス名・チャンネル構成・アプリの場所を確認させた方が失敗が少なくなります。
+
+```text
+このHi-Res RecorderをMacで使えるようにセットアップして。
+READMEの手順に従い、uv環境、BlackHoleまたはLoopbackの録音専用2ch経路、
+マイク権限、アプリのビルドと起動まで確認して。ほかのアプリ音が録音に混ざらない
+設定にし、Spotify/Qobuz用の最適なサンプルレートも確認して。
+```
+
+### 自分でセットアップする場合
+
+1. Xcode Command Line Tools、Git、[uv](https://docs.astral.sh/uv/)をインストールします。
+2. [BlackHole](https://existential.audio/blackhole/)（無料）または[Loopback](https://rogueamoeba.com/loopback/)（有料）を導入し、Spotify/Qobuz専用のステレオ出力を作ります。通常のMacスピーカー出力や、通知音と共用する入力を録音先にしないでください。
+3. SpotifyまたはQobuzの出力先をその専用経路に設定します。モニター再生が必要なら、録音経路とは別にスピーカーへ送ります。
+4. ターミナルで以下を実行します。`<repository-url>`は、このGitHubリポジトリのURLに置き換えます。
+
+```bash
+git clone <repository-url>
+cd spotify_recorder
+uv sync
+uv run python spotify_recorder.py
+```
+
+5. macOSからマイク（オーディオ入力）権限を求められたら許可します。アプリのInput Deviceで専用経路を選び、左右の開始チャンネルがその経路のステレオ2chと一致することを確認します。
+6. 音楽サービス側の音量は100%にし、EQ、Crossfade、Automix、音量の均一化はOFFにします。QobuzではExclusive ModeをONにします。
+7. まず短いテスト録音を行います。レビューで入力レート、LUFS、Peak、True Peak、疑義イベントを確認し、通知音や別アプリの音が混ざっていないことを再生して確かめます。問題があれば録音せず、ルーティングを修正します。
+
+### 録音時の判断
+
+- Spotify: オフライン再生を優先し、可能なら最高音質を選びます。ただし配信版は販売用・CD・DJ向けファイルとマスタリングが異なることがあります。
+- Qobuz: Offlineは完全ダウンロードとアプリ側の品質条件を確認できた場合だけ開始できます。Streamingは回線状態を記録できますが、音声そのものからロスレスを証明することはできません。
+- DJ用途: 曲間のLUFS差やマスタリング差は、録音不良ではありません。本番用に音量を揃えたい場合は、原音記録とは別に書き出したコピーを使ってください。原音記録ファイルへ正規化をかけると、このアプリのUnity Gain方針と両立しません。
 
 ## Qobuzモード
 
@@ -52,7 +90,6 @@ Qobuzは音量100%、Exclusive Mode ON、最高配信品質を使用してくだ
 ## 開発
 
 ```bash
-cd /Users/user/Documents/Python_work/spotify_recorder
 uv sync
 uv run python spotify_recorder.py
 uv run python -m unittest discover -s tests -v
@@ -64,4 +101,4 @@ uv run python -m unittest discover -s tests -v
 uv run python -m PyInstaller --clean --noconfirm HiResRecorder.spec
 ```
 
-出力は`dist/Hi-Res Recorder.app`です。QobuzアプリがこのMacに未導入のため、fixtureによる連携テストは自動化済みですが、44.1/96/192kHzの実機録音確認はQobuz導入後に行う必要があります。
+出力は`dist/Hi-Res Recorder.app`です。Qobuz連携はfixtureによる自動テストを備えていますが、実機のアプリ構造やオーディオデバイスはバージョン・環境で変わります。44.1/96/192kHzの実機録音、再生、品質レビューを行ってから本番利用してください。
