@@ -173,6 +173,25 @@ class _Value:
 
 
 class CaptureAuditTests(unittest.TestCase):
+    def test_qobuz_offline_does_not_request_network_measurement(self):
+        with patch("spotify_quality_audit.time.time", side_effect=[1000.0, 1001.0]), patch(
+            "spotify_quality_audit.time.monotonic", side_effect=[100.0, 101.0]
+        ):
+            audit = CaptureQualityAudit(
+                96000,
+                "BlackHole 2ch",
+                {},
+                provider="qobuz",
+                source_evaluation={
+                    "conditions_pass": True,
+                    "mode": "offline",
+                    "assurance_label": "Qobuz Offline条件適合・bit一致未証明",
+                },
+            )
+            result = audit.finish()
+
+        self.assertFalse(any("回線実測" in note for note in result["notes"]))
+
     def test_quality_gate_pass_does_not_claim_lossless_verification(self):
         with patch("spotify_quality_audit.time.time", side_effect=[1000.0, 1010.0]), patch(
             "spotify_quality_audit.time.monotonic", side_effect=[100.0, 110.0]

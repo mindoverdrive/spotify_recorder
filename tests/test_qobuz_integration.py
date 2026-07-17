@@ -77,6 +77,11 @@ class QobuzStateTests(unittest.TestCase):
         self.assertTrue(snapshot["exclusive_mode"])
         self.assertEqual(snapshot["volume_percent"], 100.0)
 
+        with tempfile.TemporaryDirectory() as directory:
+            create_qobuz_fixture(directory)
+            adapter_snapshot = QobuzSourceAdapter(directory).snapshot()
+        self.assertEqual(adapter_snapshot["source_mode"], "offline")
+
     def test_parse_player_state_handles_nested_artist_and_album(self):
         result = parse_qobuz_player_state(
             {
@@ -126,7 +131,7 @@ class QobuzGateTests(unittest.TestCase):
 
     def test_accepts_complete_offline_capture_path(self):
         result = evaluate_qobuz_capture_gate(
-            self.snapshot, self.device, "Offline"
+            self.snapshot, self.device
         )
 
         self.assertTrue(result["conditions_pass"])
@@ -145,7 +150,7 @@ class QobuzGateTests(unittest.TestCase):
             "nominal_sample_rate": 44100,
             "is_aggregate": True,
         }
-        result = evaluate_qobuz_capture_gate(snapshot, device, "Offline")
+        result = evaluate_qobuz_capture_gate(snapshot, device)
 
         self.assertFalse(result["conditions_pass"])
         self.assertTrue(any("完全ダウンロード" in item for item in result["warnings"]))
@@ -154,22 +159,17 @@ class QobuzGateTests(unittest.TestCase):
         self.assertTrue(any("Lossless形式" in item for item in result["warnings"]))
         self.assertTrue(any("出力先" in item for item in result["warnings"]))
 
-    def test_streaming_manual_fallback_is_explicitly_unverified(self):
+    def test_rejects_unverified_source_without_manual_fallback(self):
         result = evaluate_qobuz_capture_gate(
             {"source_verified": False},
             self.device,
-            "Streaming",
-            {
-                "source_sample_rate": 96000,
-                "source_bit_depth": 24,
-                "source_channels": 2,
-                "confirmed": True,
-            },
         )
 
-        self.assertTrue(result["conditions_pass"])
+        self.assertFalse(result["conditions_pass"])
         self.assertFalse(result["source_verified"])
-        self.assertIn("未検証", result["assurance_label"])
+        self.assertEqual(result["mode"], "offline")
+        self.assertTrue(any("Offlineソース" in item for item in result["warnings"]))
+        self.assertTrue(any("完全ダウンロード" in item for item in result["warnings"]))
 
     def test_self_diagnosis_rejects_missing_app_but_validates_schema(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -182,7 +182,7 @@ class QobuzGateTests(unittest.TestCase):
         self.assertTrue(result["schema_ok"])
         self.assertTrue(any("アプリ" in item for item in result["warnings"]))
 
-    def test_adapter_rejects_offline_but_degrades_streaming_when_integration_breaks(self):
+    def test_adapter_rejects_capture_when_integration_breaks(self):
         adapter = QobuzSourceAdapter()
         adapter.last_snapshot = dict(self.snapshot)
         diagnostic = {
@@ -191,22 +191,12 @@ class QobuzGateTests(unittest.TestCase):
             "app_running": True,
             "warnings": ["Qobuz DBスキーマが未対応です"],
         }
-        manual = {
-            "source_sample_rate": 96000,
-            "source_bit_depth": 24,
-            "source_channels": 2,
-            "confirmed": True,
-        }
         with patch("source_providers.diagnose_qobuz_integration", return_value=diagnostic):
-            offline = adapter.preflight(self.device, mode="Offline", manual_source=manual)
-            streaming = adapter.preflight(
-                self.device, mode="Streaming", manual_source=manual
-            )
+            offline = adapter.preflight(self.device)
 
         self.assertFalse(offline["conditions_pass"])
-        self.assertTrue(streaming["conditions_pass"])
-        self.assertFalse(streaming["source_verified"])
-        self.assertIn("未検証", streaming["assurance_label"])
+        self.assertEqual(offline["mode"], "offline")
+        self.assertIn("Offline証跡", offline["assurance_label"])
 
     def test_log_tailer_records_buffering_interval_after_priming(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,6 +1,6 @@
 [project]
 name = "hi-res-recorder"
-version = "4.1.0"
+version = "4.1.1"
 description = "Unity-gain recorder with verified TPDF 24-bit FLAC export"
 readme = "README.md"
 requires-python = ">=3.12"

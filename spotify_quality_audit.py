@@ -12,7 +12,6 @@ import numpy as np
 
 SPOTIFY_LOSSLESS_ENUM_CANDIDATE = 5
 SPOTIFY_RECOMMENDED_MIN_MBPS = 2.0
-QOBUZ_RECOMMENDED_MIN_MBPS = 10.0
 NETWORK_TEST_FRESHNESS_SEC = 30 * 60
 
 
@@ -703,12 +702,14 @@ class CaptureQualityAudit:
                 f"{self.provider_label}再生/録音経路の重大イベントを{len(source_problem_events)}件検出しました"
             )
 
-        if not self.network_test:
-            notes.append("録音前の回線実測は未実行です")
-        elif not network_test_is_fresh(self.network_test, ended_at):
-            notes.append("回線実測は30分より古いため参考値です")
-        elif not self.network_test.get("pass"):
-            warnings.extend(self.network_test.get("warnings", []))
+        offline_source = self.source_evaluation.get("mode") == "offline"
+        if not offline_source:
+            if not self.network_test:
+                notes.append("録音前の回線実測は未実行です")
+            elif not network_test_is_fresh(self.network_test, ended_at):
+                notes.append("回線実測は30分より古いため参考値です")
+            elif not self.network_test.get("pass"):
+                warnings.extend(self.network_test.get("warnings", []))
 
         network = dict(network_summary or {})
         if network.get("error"):

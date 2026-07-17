@@ -1,6 +1,6 @@
 # Hi-Res Recorder
 
-Spotify/Qobuz Desktopの出力をアプリ内で音量を変えずに32-bit floatで記録し、TPDFディザ付き24-bit FLACへ自動変換して、録音品質と疑義箇所を管理するmacOSアプリです。Native版が正式系で、Nextは実験用プロトタイプとして残しています。
+Spotifyの出力とQobuz DesktopのOffline再生出力をアプリ内で音量を変えずに32-bit floatで記録し、TPDFディザ付き24-bit FLACへ自動変換して、録音品質と疑義箇所を管理するmacOSアプリです。Native版が正式系で、Nextは実験用プロトタイプとして残しています。
 
 録音には、音楽アプリ専用の仮想オーディオ経路を使います。LoopbackはRogue Amoeba製の有料ルーティングアプリ、BlackHoleは無料で使える仮想オーディオドライバです。Macの通常の入力1/2chを直接録音すると、通知音やブラウザなど他アプリの音が混ざる可能性があります。専用の2ch経路を用意し、SpotifyまたはQobuzだけをそこへ出力してください。
 
@@ -53,26 +53,19 @@ uv run python spotify_recorder.py
 ### 録音時の判断
 
 - Spotify: オフライン再生を優先し、可能なら最高音質を選びます。ただし配信版は販売用・CD・DJ向けファイルとマスタリングが異なることがあります。
-- Qobuz: Offlineは完全ダウンロードとアプリ側の品質条件を確認できた場合だけ開始できます。Streamingは回線状態を記録できますが、音声そのものからロスレスを証明することはできません。
+- Qobuz: Offline専用です。完全ダウンロードとアプリ側の品質条件を確認できた場合だけ開始できます。ローカル証跡を取得できない場合、手動入力での代替やStreaming録音は行いません。
 - DJ用途: 曲間のLUFS差やマスタリング差は、録音不良ではありません。本番用に音量を揃えたい場合は、原音記録とは別に書き出したコピーを使ってください。原音記録ファイルへ正規化をかけると、このアプリのUnity Gain方針と両立しません。
 
-## Qobuzモード
+## Qobuz Offlineモード
 
-Qobuz Desktopのローカル状態、SQLite、ログを読み取り専用で監視します。認証情報、非公開API、Qobuz Connect、暗号化キャッシュ、復号鍵にはアクセスしません。
-
-### Offline
+Qobuz Desktopのローカル状態、SQLite、ログを読み取り専用で監視します。Qobuzの録音経路はOffline固定で、Streamingへの切り替えや手動証跡による品質ゲートの迂回はできません。認証情報、非公開API、Qobuz Connect、暗号化キャッシュ、復号鍵にはアクセスしません。
 
 完全ダウンロード、曲ID、配信形式、サンプルレート、bit深度、音量100%、ミュートOFF、Exclusive Mode ONを確認できた場合だけ録音できます。ローカル構造が未対応の場合は開始を拒否します。
-
-### Streaming
-
-ローカル証跡が取れる場合は同じ厳格ゲートを使います。取得不能時は手動でサンプルレート/bit深度と設定確認を入力できますが、履歴には「Qobuzソース品質未検証」と保存されます。QobuzはHi-Resストリーミングに10Mbps超を推奨しているため、録音前の回線実測基準も10Mbpsです。
 
 Qobuz公式資料:
 
 - https://help.qobuz.com/en/articles/10139-what-is-in-the-streaming-catalogue
 - https://help.qobuz.com/en/articles/10137-in-what-quality-can-i-listen-to-music-in-offline-playback
-- https://help.qobuz.com/en/articles/10149-do-i-need-a-good-internet-connection-to-stream-in-hi-res
 
 ## 厳格録音経路
 

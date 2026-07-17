@@ -49,7 +49,6 @@ from source_providers import (
     PROVIDER_QOBUZ,
     PROVIDER_SPOTIFY,
     PROVIDERS,
-    QOBUZ_MODES,
     QOBUZ_OFFLINE,
     create_provider_adapters,
 )
@@ -100,10 +99,6 @@ class HiResRecorderApp(ctk.CTk):
         self.ui_queue = queue.Queue()
         self.save_dir = ctk.StringVar(value=os.path.expanduser("~/Music/Hi-Res Recorder"))
         self.provider = ctk.StringVar(value=PROVIDER_SPOTIFY)
-        self.qobuz_mode = ctk.StringVar(value=QOBUZ_OFFLINE)
-        self.qobuz_manual_rate = ctk.IntVar(value=44100)
-        self.qobuz_manual_depth = ctk.IntVar(value=24)
-        self.qobuz_manual_confirmed = ctk.BooleanVar(value=False)
         self.maximum_recording_minutes = ctk.IntVar(value=120)
         self.record_ch_start = ctk.IntVar(value=5)
         self.silence_threshold_db = ctk.DoubleVar(value=-60.0)
@@ -181,14 +176,12 @@ class HiResRecorderApp(ctk.CTk):
             command=self.on_provider_change,
         )
         self.provider_menu.pack(side="left", padx=(8, 18))
-        ctk.CTkLabel(source_controls, text="Qobuz経路").pack(side="left")
-        self.qobuz_mode_menu = ctk.CTkSegmentedButton(
+        self.qobuz_mode_label = ctk.CTkLabel(
             source_controls,
-            values=QOBUZ_MODES,
-            variable=self.qobuz_mode,
-            command=lambda _value: self.refresh_source_quality_status(log_result=True),
+            text="Qobuz経路: Offlineのみ",
+            text_color="#808995",
         )
-        self.qobuz_mode_menu.pack(side="left", padx=8)
+        self.qobuz_mode_label.pack(side="left")
 
         info = ctk.CTkFrame(root, fg_color="#1f2328", corner_radius=8)
         info.pack(fill="x", padx=18, pady=4)
@@ -309,19 +302,9 @@ class HiResRecorderApp(ctk.CTk):
         self.add_entry(settings, 6, "最終断片 秒", self.discard_tail_under_sec, "停止時の最終曲がこれ以下なら破棄")
         self.add_entry(settings, 7, "自動停止猶予 秒", self.auto_stop_grace_sec, "ソース停止後に待つ秒数")
         self.add_entry(settings, 8, "最大録音 分", self.maximum_recording_minutes, "空き容量の事前検査に使用")
-        self.add_entry(settings, 9, "Qobuz手動 Hz", self.qobuz_manual_rate, "Streaming代替証跡")
-        self.add_entry(settings, 10, "Qobuz手動 bit", self.qobuz_manual_depth, "16または24")
-        self.qobuz_confirm_switch = ctk.CTkSwitch(
-            settings,
-            text="Qobuz音量100% / Exclusive ON / Stereoを手動確認",
-            variable=self.qobuz_manual_confirmed,
-            progress_color="#1DB954",
-        )
-        self.qobuz_confirm_switch.grid(row=11, column=1, sticky="w", padx=12, pady=6)
-
-        ctk.CTkLabel(settings, text="保存先").grid(row=12, column=0, sticky="w", padx=12, pady=8)
+        ctk.CTkLabel(settings, text="保存先").grid(row=9, column=0, sticky="w", padx=12, pady=8)
         dir_frame = ctk.CTkFrame(settings, fg_color="transparent")
-        dir_frame.grid(row=12, column=1, sticky="ew", padx=12, pady=8)
+        dir_frame.grid(row=9, column=1, sticky="ew", padx=12, pady=8)
         dir_frame.grid_columnconfigure(0, weight=1)
         self.dir_label = ctk.CTkLabel(dir_frame, textvariable=self.save_dir, anchor="w", fg_color="#252b33", corner_radius=5)
         self.dir_label.grid(row=0, column=0, sticky="ew", padx=(0, 8))
@@ -396,17 +379,13 @@ class HiResRecorderApp(ctk.CTk):
         self.standby_switch.configure(state=locked_state)
         self.mode_menu.configure(state=locked_state)
         self.provider_menu.configure(state=locked_state)
-        self.qobuz_mode_menu.configure(
-            state=(
-                "disabled"
-                if recording or self.provider.get() != PROVIDER_QOBUZ
-                else "normal"
-            )
-        )
-        self.qobuz_confirm_switch.configure(state=locked_state)
         self.diag_btn.configure(state=locked_state)
         self.network_test_btn.configure(
-            state="disabled" if recording or self.network_test_running else "normal"
+            state=(
+                "disabled"
+                if recording or self.network_test_running or self.provider.get() == PROVIDER_QOBUZ
+                else "normal"
+            )
         )
         for entry in self.setting_entries:
             entry.configure(state=locked_state)
@@ -608,7 +587,10 @@ class HiResRecorderApp(ctk.CTk):
 
     def on_provider_change(self, value, refresh=True):
         is_qobuz = value == PROVIDER_QOBUZ
-        self.qobuz_mode_menu.configure(state="normal" if is_qobuz else "disabled")
+        self.qobuz_mode_label.configure(text_color="#63f08f" if is_qobuz else "#808995")
+        self.network_test_btn.configure(
+            state="disabled" if is_qobuz or self.network_test_running else "normal"
+        )
         self.standby_switch.configure(
             text=f"Standby: {value}再生で自動開始"
         )
@@ -618,14 +600,6 @@ class HiResRecorderApp(ctk.CTk):
         self.last_network_test = None
         if refresh:
             self.refresh_source_quality_status(log_result=True)
-
-    def qobuz_manual_source(self):
-        return {
-            "source_sample_rate": int(self.qobuz_manual_rate.get()),
-            "source_bit_depth": int(self.qobuz_manual_depth.get()),
-            "source_channels": 2,
-            "confirmed": bool(self.qobuz_manual_confirmed.get()),
-        }
 
     def current_device_profile(self):
         if self.device_in_id is None:
@@ -654,11 +628,7 @@ class HiResRecorderApp(ctk.CTk):
                 "nominal_sample_rate": self.sample_rate,
                 "max_input_channels": int(device_info["max_input_channels"]),
             }
-        return adapter.preflight(
-            device,
-            mode=self.qobuz_mode.get(),
-            manual_source=self.qobuz_manual_source(),
-        )
+        return adapter.preflight(device)
 
     def browse_dir(self):
         folder = filedialog.askdirectory(initialdir=self.save_dir.get())
@@ -668,8 +638,6 @@ class HiResRecorderApp(ctk.CTk):
     def run_diagnostics(self):
         self.log_message("=== 診断を実行中 ===")
         adapter = self.current_adapter()
-        mode = self.qobuz_mode.get()
-        manual_source = self.qobuz_manual_source()
         sample_rate = self.sample_rate
 
         def diag_thread():
@@ -681,8 +649,6 @@ class HiResRecorderApp(ctk.CTk):
             lines = adapter.diagnostics(
                 sample_rate,
                 device=device,
-                mode=mode,
-                manual_source=manual_source,
             )
             for line in lines:
                 self.log_message(line)
@@ -704,6 +670,9 @@ class HiResRecorderApp(ctk.CTk):
         return self.spotify_quality_settings
 
     def run_network_preflight(self):
+        if self.provider.get() == PROVIDER_QOBUZ:
+            self.log_message("QobuzはOffline専用です。完全ダウンロード証跡を品質診断で確認してください。")
+            return
         if self.is_recording or self.network_test_running:
             self.log_message("録音中または実測中のため、回線実測を開始できません。")
             return
@@ -751,7 +720,10 @@ class HiResRecorderApp(ctk.CTk):
             except TclError:
                 # 監視タイマー自身が発火中なら、取り消し対象は既に存在しない。
                 pass
-        self.network_test_btn.configure(state="normal", text="回線実測")
+        self.network_test_btn.configure(
+            state="disabled" if self.provider.get() == PROVIDER_QOBUZ else "normal",
+            text="回線実測",
+        )
 
         if timeout:
             self.log_message(
@@ -877,7 +849,7 @@ class HiResRecorderApp(ctk.CTk):
             "artwork_url": info.get("artwork_url"),
             "provider": str(info.get("provider") or self.provider.get()).lower(),
             "source_mode": (
-                self.qobuz_mode.get().lower()
+                QOBUZ_OFFLINE.lower()
                 if self.provider.get() == PROVIDER_QOBUZ
                 else info.get("source_mode", "streaming")
             ),
@@ -973,12 +945,14 @@ class HiResRecorderApp(ctk.CTk):
             source_evaluation=source_evaluation,
         )
         adapter = self.current_adapter()
-        self.spotify_network_monitor = ProcessNetworkMonitor(
-            adapter.process_prefixes,
-            adapter.name,
-        )
-        if not self.spotify_network_monitor.start():
-            self.log_message(f"{adapter.name}通信量モニターを開始できません。音声録音は継続します。")
+        self.spotify_network_monitor = None
+        if self.provider.get() != PROVIDER_QOBUZ:
+            self.spotify_network_monitor = ProcessNetworkMonitor(
+                adapter.process_prefixes,
+                adapter.name,
+            )
+            if not self.spotify_network_monitor.start():
+                self.log_message(f"{adapter.name}通信量モニターを開始できません。音声録音は継続します。")
         self.log_message(f"録音監査開始: {source_evaluation['assurance_label']}")
 
         self.spotify_idle_since = None

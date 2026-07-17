@@ -22,8 +22,6 @@ PROVIDER_SPOTIFY = "Spotify"
 PROVIDER_QOBUZ = "Qobuz"
 PROVIDERS = [PROVIDER_SPOTIFY, PROVIDER_QOBUZ]
 QOBUZ_OFFLINE = "Offline"
-QOBUZ_STREAMING = "Streaming"
-QOBUZ_MODES = [QOBUZ_OFFLINE, QOBUZ_STREAMING]
 
 
 @dataclass
@@ -85,7 +83,6 @@ class SpotifySourceAdapter:
 class QobuzSourceAdapter:
     name = PROVIDER_QOBUZ
     process_prefixes = ("qobuz",)
-    recommended_min_mbps = 10.0
 
     def __init__(self, qobuz_dir=None):
         self.qobuz_dir = qobuz_dir
@@ -96,6 +93,7 @@ class QobuzSourceAdapter:
 
     def snapshot(self):
         self.last_snapshot = get_qobuz_snapshot(self.qobuz_dir)
+        self.last_snapshot["source_mode"] = QOBUZ_OFFLINE.lower()
         return self.last_snapshot
 
     def quality_status(self):
@@ -122,7 +120,7 @@ class QobuzSourceAdapter:
         }
         return ProviderStatus("qobuz", label, passed, settings, list(dict.fromkeys(warnings)))
 
-    def diagnostics(self, sample_rate, device=None, mode=QOBUZ_OFFLINE, manual_source=None):
+    def diagnostics(self, sample_rate, device=None):
         diagnostic = diagnose_qobuz_integration(self.qobuz_dir)
         lines = [
             "OK: Capture Gain = Unity Gain 1.0 / DSPなし",
@@ -135,7 +133,7 @@ class QobuzSourceAdapter:
         else:
             lines.extend(f"警告: {warning}" for warning in diagnostic["warnings"])
         if device:
-            gate = self.preflight(device, mode=mode, manual_source=manual_source)
+            gate = self.preflight(device)
             lines.extend(
                 ("OK: " if gate["conditions_pass"] else "拒否: ") + gate["assurance_label"]
                 for _ in [0]
@@ -149,15 +147,11 @@ class QobuzSourceAdapter:
     def format_quality(self, status):
         return status.label
 
-    def preflight(self, device, mode=QOBUZ_OFFLINE, manual_source=None):
+    def preflight(self, device):
         diagnostic = diagnose_qobuz_integration(self.qobuz_dir)
         snapshot = dict(self.last_snapshot or self.snapshot())
-        offline = str(mode).lower() == "offline"
-        if not diagnostic["available"] and not offline:
-            snapshot["source_verified"] = False
-            snapshot["source_error"] = "Qobuzローカル証跡の自己診断に失敗しました"
-        result = evaluate_qobuz_capture_gate(snapshot, device, mode, manual_source)
-        if offline and not diagnostic["available"]:
+        result = evaluate_qobuz_capture_gate(snapshot, device)
+        if not diagnostic["available"]:
             result["warnings"] = list(
                 dict.fromkeys(result["warnings"] + diagnostic["warnings"])
             )

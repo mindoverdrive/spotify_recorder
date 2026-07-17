@@ -390,21 +390,17 @@ def get_qobuz_snapshot(qobuz_dir=None):
     return snapshot
 
 
-def evaluate_qobuz_capture_gate(snapshot, device, mode, manual_source=None):
-    manual = dict(manual_source or {})
-    offline = str(mode).lower() == "offline"
+def evaluate_qobuz_capture_gate(snapshot, device):
     source_verified = bool(snapshot.get("source_verified"))
-    source_rate = snapshot.get("source_sample_rate") if source_verified else manual.get("source_sample_rate")
-    source_depth = snapshot.get("source_bit_depth") if source_verified else manual.get("source_bit_depth")
-    source_channels = snapshot.get("source_channels") if source_verified else manual.get("source_channels", 2)
+    source_rate = snapshot.get("source_sample_rate")
+    source_depth = snapshot.get("source_bit_depth")
+    source_channels = snapshot.get("source_channels")
     warnings = []
 
-    if offline and not source_verified:
+    if not source_verified:
         warnings.append(snapshot.get("source_error") or "Qobuz Offlineソースを検証できません")
-    if offline and not snapshot.get("is_completed"):
+    if not snapshot.get("is_completed"):
         warnings.append("Qobuz Offlineトラックの完全ダウンロードを確認できません")
-    if not offline and not source_verified and not manual.get("confirmed"):
-        warnings.append("手動証跡モードのQobuz設定確認が完了していません")
     if not source_rate or not source_depth:
         warnings.append("Qobuzソースのサンプルレート/bit深度が不明です")
     if source_rate and _as_int(source_rate) not in QOBUZ_SUPPORTED_SAMPLE_RATES:
@@ -452,13 +448,9 @@ def evaluate_qobuz_capture_gate(snapshot, device, mode, manual_source=None):
             f"Qobuz出力先と録音入力が一致しません: {output_name} / {device.get('name')}"
         )
 
-    verified_label = (
-        "Qobuz Offline条件適合・bit一致未証明"
-        if offline
-        else "Qobuz配信条件適合・bit一致未証明"
-    )
+    verified_label = "Qobuz Offline条件適合・bit一致未証明"
     if not source_verified:
-        verified_label = "Qobuzソース品質未検証（手動証跡）"
+        verified_label = "Qobuz Offlineソース品質未検証"
     return {
         "conditions_pass": not warnings,
         "warnings": warnings,
@@ -467,7 +459,7 @@ def evaluate_qobuz_capture_gate(snapshot, device, mode, manual_source=None):
         "source_bit_depth": _as_int(source_depth),
         "source_channels": _as_int(source_channels),
         "assurance_label": verified_label if not warnings else f"要確認: {verified_label}",
-        "mode": "offline" if offline else "streaming",
+        "mode": "offline",
         "evidence": {
             "track_id": snapshot.get("track_id"),
             "format_id": snapshot.get("format_id"),
