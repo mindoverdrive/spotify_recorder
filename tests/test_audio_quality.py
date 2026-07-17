@@ -147,9 +147,10 @@ class FloatWavSaveTests(unittest.TestCase):
             "assurance_label": "品質条件に要確認・実効Lossless未証明",
             "sample_rate": SAMPLE_RATE,
             "spotify_settings": {
-                "streaming_quality_raw": 5,
-                "auto_downgrade": False,
+                "download_quality_raw": 5,
+                "offline_mode": {"available": True, "enabled": True},
             },
+            "source_evaluation": {"mode": "offline"},
             "callback_status_count": 1,
             "playback_stall_count": 1,
             "playback_stall_sec": 1.25,
@@ -204,6 +205,8 @@ class FloatWavSaveTests(unittest.TestCase):
             tags = WAVE(path).tags
 
             self.assertEqual(tags.get("TXXX:Lossless Verified").text[0].split(" - ")[0], "No")
+            self.assertEqual(tags.get("TXXX:Source Mode").text, ["offline"])
+            self.assertEqual(tags.get("TXXX:Spotify Offline Mode").text, ["Enabled"])
             self.assertIn("1 events", tags.get("TXXX:Playback Stall Suspicions").text[0])
             self.assertIn("1 events", tags.get("TXXX:Timeline Slip Suspicions").text[0])
             self.assertEqual(tags.get("TXXX:Callback Boundary Discontinuities").text, ["1"])

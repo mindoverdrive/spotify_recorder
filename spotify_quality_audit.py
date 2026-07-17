@@ -1,8 +1,6 @@
-import csv
 import glob
 import json
 import os
-import shutil
 import subprocess
 import threading
 import time
@@ -11,8 +9,30 @@ import numpy as np
 
 
 SPOTIFY_LOSSLESS_ENUM_CANDIDATE = 5
-SPOTIFY_RECOMMENDED_MIN_MBPS = 2.0
-NETWORK_TEST_FRESHNESS_SEC = 30 * 60
+
+SPOTIFY_OFFLINE_MODE_SCRIPT = r'''
+tell application "System Events"
+    if not (exists process "Spotify") then return "CLOSED"
+    tell process "Spotify"
+        repeat with barItem in menu bar items of menu bar 1
+            try
+                repeat with candidate in menu items of menu 1 of barItem
+                    set itemName to name of candidate as text
+                    if itemName is "Offline Mode" or itemName is "オフラインモード" or itemName is "オフライン モード" then
+                        set markValue to ""
+                        try
+                            set markValue to value of attribute "AXMenuItemMarkChar" of candidate
+                        end try
+                        if markValue is missing value or markValue is "" then return "OFF"
+                        return "ON"
+                    end if
+                end repeat
+            end try
+        end repeat
+    end tell
+end tell
+return "UNAVAILABLE"
+'''
 
 
 def _parse_pref_value(raw_value):
@@ -42,7 +62,45 @@ def parse_spotify_prefs(text):
     return prefs
 
 
-def read_spotify_quality_settings(spotify_dir=None):
+def read_spotify_offline_mode():
+    try:
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", SPOTIFY_OFFLINE_MODE_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        return {
+            "available": False,
+            "enabled": False,
+            "error": f"Spotify Offline Mode確認に失敗しました: {exc}",
+        }
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"osascript終了コード {result.returncode}"
+        return {
+            "available": False,
+            "enabled": False,
+            "error": (
+                "Spotify Offline Modeを確認できません。macOSのアクセシビリティで"
+                f"Hi-Res Recorderを許可してください: {detail}"
+            ),
+        }
+
+    state = result.stdout.strip().upper()
+    if state == "ON":
+        return {"available": True, "enabled": True, "evidence": "Spotify menu mark"}
+    if state == "OFF":
+        return {"available": True, "enabled": False, "evidence": "Spotify menu mark"}
+    error = (
+        "Spotifyが起動していません"
+        if state == "CLOSED"
+        else "SpotifyのOffline Modeメニューを確認できません"
+    )
+    return {"available": False, "enabled": False, "error": error}
+
+
+def read_spotify_quality_settings(spotify_dir=None, offline_mode=None):
     base_dir = spotify_dir or os.path.expanduser("~/Library/Application Support/Spotify")
     candidates = glob.glob(os.path.join(base_dir, "Users", "*-user", "prefs"))
     if not candidates:
@@ -58,17 +116,13 @@ def read_spotify_quality_settings(spotify_dir=None):
     except OSError as exc:
         return {"available": False, "error": str(exc)}
 
-    streaming_quality = prefs.get(
-        "audio.play_bitrate_non_metered_enumeration",
-        prefs.get("audio.play_bitrate_enumeration"),
-    )
+    offline = read_spotify_offline_mode() if offline_mode is None else dict(offline_mode)
     return {
         "available": True,
-        "streaming_quality_raw": streaming_quality,
         "download_quality_raw": prefs.get("audio.sync_bitrate_enumeration"),
-        "auto_downgrade": prefs.get("audio.allow_downgrade"),
         "normalize": prefs.get("audio.normalize_v2"),
         "automix": prefs.get("audio.automix"),
+        "offline_mode": offline,
         "source_note": "Spotify非公開prefsの観測値",
     }
 
@@ -81,21 +135,26 @@ def evaluate_spotify_quality_settings(settings):
         return {
             "conditions_pass": False,
             "lossless_candidate": False,
-            "auto_downgrade_disabled": False,
+            "offline_mode_enabled": False,
             "warnings": warnings,
             "notes": notes,
             "label": "設定未確認・実効Lossless未証明",
         }
 
-    quality = settings.get("streaming_quality_raw")
+    quality = settings.get("download_quality_raw")
     lossless_candidate = quality == SPOTIFY_LOSSLESS_ENUM_CANDIDATE
-    auto_downgrade_disabled = settings.get("auto_downgrade") is False
+    offline_mode = dict(settings.get("offline_mode") or {})
+    offline_mode_enabled = bool(
+        offline_mode.get("available") and offline_mode.get("enabled")
+    )
     if not lossless_candidate:
         warnings.append(
-            f"Spotify音質設定の観測値がLossless候補(5)ではありません: {quality!r}"
+            f"Spotifyダウンロード音質の観測値がLossless候補(5)ではありません: {quality!r}"
         )
-    if not auto_downgrade_disabled:
-        warnings.append("Spotifyの音質自動低下OFFを確認できません")
+    if not offline_mode.get("available"):
+        warnings.append(offline_mode.get("error", "Spotify Offline Modeを確認できません"))
+    elif not offline_mode.get("enabled"):
+        warnings.append("SpotifyのFile > Offline ModeがOFFです")
     if settings.get("normalize") is not False:
         warnings.append("Spotifyの音量の均一OFFを確認できません")
     if settings.get("automix") is not False:
@@ -103,15 +162,15 @@ def evaluate_spotify_quality_settings(settings):
 
     conditions_pass = not warnings
     label = (
-        "Lossless設定条件適合・実効品質は未証明"
+        "Offline/Lossless設定条件適合・実効品質は未証明"
         if conditions_pass
-        else "Lossless設定条件に要確認・実効品質は未証明"
+        else "Offline/Lossless設定条件に要確認・実効品質は未証明"
     )
     notes.append("音質値5の意味はSpotifyの非公開実装に基づく候補判定です")
     return {
         "conditions_pass": conditions_pass,
         "lossless_candidate": lossless_candidate,
-        "auto_downgrade_disabled": auto_downgrade_disabled,
+        "offline_mode_enabled": offline_mode_enabled,
         "warnings": warnings,
         "notes": notes,
         "label": label,
@@ -123,260 +182,11 @@ def format_spotify_quality_settings(settings):
     if not settings.get("available"):
         return evaluation["label"]
     return (
-        f"{evaluation['label']} / 音質値 {settings.get('streaming_quality_raw')} / "
-        f"自動低下 {'OFF' if settings.get('auto_downgrade') is False else '未確認'} / "
+        f"{evaluation['label']} / Offline "
+        f"{'ON' if evaluation['offline_mode_enabled'] else '未確認'} / "
+        f"DL音質値 {settings.get('download_quality_raw')} / "
         f"音量均一 {'OFF' if settings.get('normalize') is False else '未確認'}"
     )
-
-
-def parse_network_quality_output(
-    output,
-    measured_at=None,
-    minimum_mbps=SPOTIFY_RECOMMENDED_MIN_MBPS,
-    provider_label="Spotify",
-):
-    payload = json.loads(output)
-    throughput_bps = float(payload.get("dl_throughput", 0.0))
-    download_mbps = throughput_bps / 1_000_000.0
-    base_rtt = payload.get("base_rtt")
-    interface_name = payload.get("interface_name")
-    warnings = []
-    if download_mbps < float(minimum_mbps):
-        warnings.append(
-            f"下り実測が{provider_label}推奨下限{float(minimum_mbps):.1f} Mbps未満です"
-        )
-    if interface_name and str(interface_name).startswith("utun"):
-        warnings.append("VPN/トンネル経由の測定です")
-    return {
-        "available": True,
-        "measured_at": float(measured_at if measured_at is not None else time.time()),
-        "download_mbps": download_mbps,
-        "base_rtt_ms": None if base_rtt is None else float(base_rtt),
-        "interface_name": interface_name,
-        "endpoint": payload.get("test_endpoint"),
-        "pass": download_mbps >= float(minimum_mbps),
-        "minimum_mbps": float(minimum_mbps),
-        "provider": str(provider_label).lower(),
-        "warnings": warnings,
-    }
-
-
-def run_network_quality_test(
-    max_runtime=15,
-    minimum_mbps=SPOTIFY_RECOMMENDED_MIN_MBPS,
-    provider_label="Spotify",
-):
-    executable = shutil.which("networkQuality")
-    if not executable:
-        return {"available": False, "error": "networkQualityコマンドがありません"}
-    try:
-        runtime_seconds = max(1, int(max_runtime))
-    except (TypeError, ValueError) as exc:
-        return {"available": False, "error": f"回線実測時間が不正です: {exc}"}
-
-    try:
-        result = subprocess.run(
-            [executable, "-c", "-u", "-M", str(runtime_seconds)],
-            capture_output=True,
-            text=True,
-            timeout=runtime_seconds + 15,
-        )
-    except Exception as exc:
-        # networkQualityの出力デコード失敗なども、UIを待機状態のままにしない。
-        detail = str(exc) or type(exc).__name__
-        return {"available": False, "error": f"networkQuality実行失敗: {detail}"}
-    if result.returncode != 0:
-        return {
-            "available": False,
-            "error": result.stderr.strip() or f"networkQuality終了コード: {result.returncode}",
-        }
-    try:
-        return parse_network_quality_output(
-            result.stdout,
-            minimum_mbps=minimum_mbps,
-            provider_label=provider_label,
-        )
-    except (ValueError, TypeError, json.JSONDecodeError) as exc:
-        return {"available": False, "error": f"回線実測結果を解析できません: {exc}"}
-
-
-def network_test_is_fresh(result, now=None):
-    if not result or not result.get("available") or "measured_at" not in result:
-        return False
-    current = time.time() if now is None else float(now)
-    return 0.0 <= current - float(result["measured_at"]) <= NETWORK_TEST_FRESHNESS_SEC
-
-
-def format_network_quality(result):
-    if not result or not result.get("available"):
-        return f"回線実測なし: {(result or {}).get('error', '未実行')}"
-    rtt = result.get("base_rtt_ms")
-    rtt_text = "不明" if rtt is None else f"{rtt:.1f} ms"
-    verdict = "基準通過" if result.get("pass") else "基準未達"
-    return (
-        f"下り {result['download_mbps']:.1f} Mbps / RTT {rtt_text} / "
-        f"{result.get('interface_name') or 'interface不明'} / {verdict}"
-    )
-
-
-class ProcessNetworkMonitor:
-    def __init__(self, process_prefixes=("spotify",), provider_label="Spotify", interval_sec=2.0):
-        self.process_prefixes = tuple(str(value).lower() for value in process_prefixes)
-        self.provider_label = str(provider_label)
-        self.interval_sec = float(interval_sec)
-        self._lock = threading.Lock()
-        self._process = None
-        self._thread = None
-        self._current_snapshot = {}
-        self._last_snapshot = None
-        self._last_snapshot_time = None
-        self._samples = []
-        self._error = None
-        self._started = False
-        self._saw_header = False
-
-    def start(self):
-        executable = shutil.which("nettop")
-        if not executable:
-            self._error = "nettopコマンドがありません"
-            return False
-        try:
-            self._process = subprocess.Popen(
-                [
-                    executable,
-                    "-P",
-                    "-L",
-                    "0",
-                    "-s",
-                    str(self.interval_sec),
-                    "-x",
-                    "-J",
-                    "bytes_in,bytes_out",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-        except OSError as exc:
-            self._error = str(exc)
-            return False
-        self._started = True
-        self._thread = threading.Thread(target=self._read_output, daemon=True)
-        self._thread.start()
-        return True
-
-    def _is_target_process(self, process_name):
-        base_name, separator, pid = process_name.rpartition(".")
-        if separator and pid.isdigit():
-            process_name = base_name
-        return process_name.lower().startswith(self.process_prefixes)
-
-    def _read_output(self):
-        assert self._process is not None
-        assert self._process.stdout is not None
-        try:
-            for raw_line in self._process.stdout:
-                try:
-                    row = next(csv.reader([raw_line]))
-                except csv.Error:
-                    continue
-                if not row:
-                    continue
-                if row[0] == "" and "bytes_in" in row:
-                    if self._saw_header:
-                        self._commit_snapshot()
-                    self._saw_header = True
-                    self._current_snapshot = {}
-                    continue
-                if not self._saw_header or len(row) < 3:
-                    continue
-                process_name = row[0].strip()
-                if not self._is_target_process(process_name):
-                    continue
-                try:
-                    self._current_snapshot[process_name] = int(row[1])
-                except ValueError:
-                    continue
-        except OSError as exc:
-            self._error = str(exc)
-
-    def _commit_snapshot(self):
-        now = time.monotonic()
-        snapshot = dict(self._current_snapshot)
-        with self._lock:
-            if self._last_snapshot is not None and self._last_snapshot_time is not None:
-                elapsed = max(now - self._last_snapshot_time, 0.001)
-                delta_bytes = sum(
-                    max(0, current - self._last_snapshot.get(process_name, current))
-                    for process_name, current in snapshot.items()
-                )
-                self._samples.append(
-                    {
-                        "elapsed_sec": elapsed,
-                        "bytes_in": delta_bytes,
-                        "target_process_seen": bool(snapshot),
-                        "spotify_process_seen": bool(snapshot),
-                    }
-                )
-            self._last_snapshot = snapshot
-            self._last_snapshot_time = now
-
-    def stop(self):
-        process = self._process
-        if process and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                process.kill()
-        if self._thread:
-            self._thread.join(timeout=1.0)
-        if self._saw_header and self._current_snapshot:
-            self._commit_snapshot()
-        return self.summary()
-
-    def summary(self):
-        with self._lock:
-            samples = list(self._samples)
-        duration = sum(sample["elapsed_sec"] for sample in samples)
-        total_bytes = sum(sample["bytes_in"] for sample in samples)
-        rates_kbps = [
-            sample["bytes_in"] * 8.0 / sample["elapsed_sec"] / 1000.0
-            for sample in samples
-        ]
-        observed = sum(1 for sample in samples if sample["target_process_seen"])
-        notes = [
-            f"{self.provider_label}通信量はバッファ/キャッシュの影響を受け、実効コーデックの証明には使えません"
-        ]
-        if self._started and observed == 0:
-            notes.append(
-                f"{self.provider_label}通信を観測できませんでした（オフライン/キャッシュ再生の可能性を含む）"
-            )
-        return {
-            "available": self._started and self._error is None,
-            "error": self._error,
-            "sample_count": len(samples),
-            "observed_intervals": observed,
-            "duration_sec": duration,
-            "inbound_total_bytes": total_bytes,
-            "inbound_average_kbps": (
-                total_bytes * 8.0 / duration / 1000.0 if duration > 0.0 else 0.0
-            ),
-            "inbound_peak_kbps": max(rates_kbps, default=0.0),
-            "zero_transfer_intervals": sum(
-                1
-                for sample in samples
-                if sample["target_process_seen"] and sample["bytes_in"] == 0
-            ),
-            "notes": notes,
-            "provider": self.provider_label.lower(),
-        }
-
-
-class SpotifyNetworkMonitor(ProcessNetworkMonitor):
-    def __init__(self, interval_sec=2.0):
-        super().__init__(("spotify",), "Spotify", interval_sec)
 
 
 class CaptureQualityAudit:
@@ -385,7 +195,6 @@ class CaptureQualityAudit:
         sample_rate,
         device_name,
         spotify_settings,
-        network_test=None,
         recording_frame_offset=0,
         provider="spotify",
         source_evaluation=None,
@@ -396,7 +205,6 @@ class CaptureQualityAudit:
         self.provider = str(provider).lower()
         self.provider_label = "Qobuz" if self.provider == "qobuz" else "Spotify"
         self.source_evaluation = dict(source_evaluation or {})
-        self.network_test = dict(network_test) if network_test else None
         self.recording_frame_offset = max(0, int(recording_frame_offset))
         self.started_at = time.time()
         self._started_monotonic = time.monotonic()
@@ -602,7 +410,7 @@ class CaptureQualityAudit:
             target = self._callback_frames if sample is None else int(sample)
             self._add_event_locked(event_type, target, detail, duration_sec)
 
-    def finish(self, network_summary=None, ended_at=None, ended_monotonic=None):
+    def finish(self, ended_at=None, ended_monotonic=None):
         ended_at = time.time() if ended_at is None else float(ended_at)
         stopped_monotonic = time.monotonic() if ended_monotonic is None else float(ended_monotonic)
         elapsed = max(0.0, stopped_monotonic - self._started_monotonic)
@@ -630,7 +438,7 @@ class CaptureQualityAudit:
         deficit_limit = max(0.75, elapsed * 0.02)
         settings_evaluation = (
             dict(self.source_evaluation)
-            if self.provider == "qobuz"
+            if self.source_evaluation
             else evaluate_spotify_quality_settings(self.spotify_settings)
         )
         settings_evaluation.setdefault("warnings", [])
@@ -702,20 +510,6 @@ class CaptureQualityAudit:
                 f"{self.provider_label}再生/録音経路の重大イベントを{len(source_problem_events)}件検出しました"
             )
 
-        offline_source = self.source_evaluation.get("mode") == "offline"
-        if not offline_source:
-            if not self.network_test:
-                notes.append("録音前の回線実測は未実行です")
-            elif not network_test_is_fresh(self.network_test, ended_at):
-                notes.append("回線実測は30分より古いため参考値です")
-            elif not self.network_test.get("pass"):
-                warnings.extend(self.network_test.get("warnings", []))
-
-        network = dict(network_summary or {})
-        if network.get("error"):
-            notes.append(f"{self.provider_label}通信監視エラー: {network['error']}")
-        notes.extend(network.get("notes", []))
-
         quality_gate_pass = not warnings
         for event in events:
             event["time_sec"] = event["sample"] / self.sample_rate
@@ -729,8 +523,6 @@ class CaptureQualityAudit:
             "spotify_settings": self.spotify_settings,
             "source_evaluation": settings_evaluation,
             "settings_evaluation": settings_evaluation,
-            "network_test": self.network_test,
-            "network_observation": network,
             "callback_frames": callback_frames,
             "callback_status_count": callback_status_count,
             "callback_status_examples": callback_status_examples,
@@ -770,19 +562,11 @@ class CaptureQualityAudit:
 def format_capture_audit(audit):
     if not audit:
         return "ソース監査なし"
-    network = audit.get("network_observation") or {}
-    provider_label = "Qobuz" if audit.get("provider") == "qobuz" else "Spotify"
-    network_text = f"{provider_label}通信未観測"
-    if network.get("sample_count"):
-        total_mb = network.get("inbound_total_bytes", 0) / 1_000_000.0
-        network_text = (
-            f"{provider_label}受信 {total_mb:.1f} MB / 平均 {network.get('inbound_average_kbps', 0):.0f} kbps"
-        )
     return (
         f"{audit.get('assurance_label', '監査不明')} / "
         f"音声異常 {audit.get('callback_status_count', 0) + audit.get('adc_timeline_gap_count', 0)} / "
         f"停止疑い {audit.get('playback_stall_count', 0)} / "
-        f"滑り疑い {audit.get('timeline_slip_count', 0)} / {network_text}"
+        f"滑り疑い {audit.get('timeline_slip_count', 0)}"
     )
 
 

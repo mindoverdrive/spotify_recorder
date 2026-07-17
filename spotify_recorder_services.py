@@ -112,13 +112,13 @@ def build_diagnostic_lines(sample_rate=None):
     settings_evaluation = evaluate_spotify_quality_settings(settings)
     if settings_evaluation["conditions_pass"]:
         lines.append(
-            "✅ Spotify設定証跡: Lossless候補 / 音質自動低下OFF / 音量均一OFF / Automix OFF"
+            "✅ Spotify設定証跡: Offline Mode ON / Losslessダウンロード候補 / 音量均一OFF / Automix OFF"
         )
     else:
         for warning in settings_evaluation["warnings"]:
             lines.append(f"⚠️ Spotify設定証跡: {warning}")
     lines.append("ℹ️ 実効コーデックはSpotify公開APIから取得できないため、Lossless断定はできません")
-    lines.append("ℹ️ Spotify推奨: EQ OFF / Crossfade OFF / 可能ならLosslessダウンロード後にOffline再生")
+    lines.append("ℹ️ SpotifyはLosslessダウンロード完了後、File > Offline Modeでのみ録音できます")
     if sample_rate is not None:
         if int(sample_rate) == 44100:
             lines.append("✅ Sample Rate: 44100 Hz (Spotifyソースと一致)")
@@ -260,8 +260,6 @@ def tag_wav(wav_path, track_info, artwork_bytes, analysis, capture_audit=None):
             settings = capture_audit.get("spotify_settings") or {}
             source = capture_audit.get("source_evaluation") or {}
             evidence = source.get("evidence") or {}
-            network_test = capture_audit.get("network_test") or {}
-            network = capture_audit.get("network_observation") or {}
             audio.tags.add(
                 TXXX(
                     encoding=3,
@@ -281,7 +279,7 @@ def tag_wav(wav_path, track_info, artwork_bytes, analysis, capture_audit=None):
                 TXXX(
                     encoding=3,
                     desc="Source Mode",
-                    text=str(source.get("mode", "streaming")),
+                    text=str(source.get("mode", "offline")),
                 )
             )
             if source.get("source_sample_rate"):
@@ -312,17 +310,17 @@ def tag_wav(wav_path, track_info, artwork_bytes, analysis, capture_audit=None):
                 audio.tags.add(
                     TXXX(
                         encoding=3,
-                        desc="Spotify Quality Setting Raw",
-                        text=str(settings.get("streaming_quality_raw", "Unknown")),
+                        desc="Spotify Download Quality Setting Raw",
+                        text=str(settings.get("download_quality_raw", "Unknown")),
                     )
                 )
                 audio.tags.add(
                     TXXX(
                         encoding=3,
-                        desc="Spotify Auto Downgrade",
+                        desc="Spotify Offline Mode",
                         text=(
-                            "Disabled"
-                            if settings.get("auto_downgrade") is False
+                            "Enabled"
+                            if (settings.get("offline_mode") or {}).get("enabled") is True
                             else "Not verified"
                         ),
                     )
@@ -388,29 +386,6 @@ def tag_wav(wav_path, track_info, artwork_bytes, analysis, capture_audit=None):
                     text=str(capture_audit.get("boundary_discontinuities", 0)),
                 )
             )
-            if network_test.get("available"):
-                audio.tags.add(
-                    TXXX(
-                        encoding=3,
-                        desc="Network Preflight Mbps",
-                        text=f'{network_test.get("download_mbps", 0.0):.2f}',
-                    )
-                )
-            if network.get("sample_count"):
-                audio.tags.add(
-                    TXXX(
-                        encoding=3,
-                        desc=f"{provider_label} Network Observed Bytes",
-                        text=str(network.get("inbound_total_bytes", 0)),
-                    )
-                )
-                audio.tags.add(
-                    TXXX(
-                        encoding=3,
-                        desc=f"{provider_label} Network Average kbps",
-                        text=f'{network.get("inbound_average_kbps", 0.0):.2f}',
-                    )
-                )
             if capture_audit.get("warnings"):
                 audio.tags.add(
                     TXXX(

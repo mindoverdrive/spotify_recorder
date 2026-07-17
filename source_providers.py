@@ -35,13 +35,11 @@ class ProviderStatus:
 
 class SpotifySourceAdapter:
     name = PROVIDER_SPOTIFY
-    process_prefixes = ("spotify",)
-    recommended_min_mbps = 2.0
 
     def snapshot(self):
         result = get_spotify_info_extended()
         result["provider"] = "spotify"
-        result.setdefault("source_mode", "streaming")
+        result["source_mode"] = "offline"
         result.setdefault("source_verified", False)
         return result
 
@@ -63,17 +61,19 @@ class SpotifySourceAdapter:
         return format_spotify_quality_settings(status.settings)
 
     def preflight(self, _device, **_kwargs):
-        status = self.quality_status()
+        settings = read_spotify_quality_settings()
+        evaluation = evaluate_spotify_quality_settings(settings)
         return {
-            "conditions_pass": status.conditions_pass,
-            "warnings": status.warnings,
+            "conditions_pass": evaluation["conditions_pass"],
+            "warnings": list(evaluation["warnings"]),
+            "notes": list(evaluation["notes"]),
             "source_verified": False,
             "source_sample_rate": 44100,
             "source_bit_depth": None,
             "source_channels": 2,
-            "assurance_label": status.label,
-            "mode": "streaming",
-            "evidence": status.settings,
+            "assurance_label": evaluation["label"],
+            "mode": "offline",
+            "evidence": settings,
         }
 
     def poll_events(self):
@@ -82,7 +82,6 @@ class SpotifySourceAdapter:
 
 class QobuzSourceAdapter:
     name = PROVIDER_QOBUZ
-    process_prefixes = ("qobuz",)
 
     def __init__(self, qobuz_dir=None):
         self.qobuz_dir = qobuz_dir

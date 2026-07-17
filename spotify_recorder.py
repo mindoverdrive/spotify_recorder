@@ -35,28 +35,20 @@ from spotify_recorder_services import (
 )
 from spotify_quality_audit import (
     CaptureQualityAudit,
-    ProcessNetworkMonitor,
-    evaluate_spotify_quality_settings,
     format_audit_events,
     format_capture_audit,
-    format_network_quality,
-    format_spotify_quality_settings,
     format_timecode,
-    read_spotify_quality_settings,
-    run_network_quality_test,
 )
 from source_providers import (
     PROVIDER_QOBUZ,
     PROVIDER_SPOTIFY,
     PROVIDERS,
-    QOBUZ_OFFLINE,
     create_provider_adapters,
 )
 
 CHECK_INTERVAL_MS = 800
 DEFAULT_SAMPLE_RATE = 44100
 DEFAULT_PRE_BUFFER_SEC = 5.0
-NETWORK_TEST_UI_TIMEOUT_MS = 45_000
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("green")
@@ -86,12 +78,7 @@ class HiResRecorderApp(ctk.CTk):
         self.latest_level = 0.0
         self._stream_start_ch = 1
         self.spotify_quality_settings = {"available": False}
-        self.last_network_test = None
-        self.network_test_running = False
-        self.network_test_id = 0
-        self.network_test_watchdog_id = None
         self.capture_quality_audit = None
-        self.spotify_network_monitor = None
         self.provider_adapters = create_provider_adapters()
         self.catalog_path = default_catalog_path()
 
@@ -176,12 +163,6 @@ class HiResRecorderApp(ctk.CTk):
             command=self.on_provider_change,
         )
         self.provider_menu.pack(side="left", padx=(8, 18))
-        self.qobuz_mode_label = ctk.CTkLabel(
-            source_controls,
-            text="Qobuz経路: Offlineのみ",
-            text_color="#808995",
-        )
-        self.qobuz_mode_label.pack(side="left")
 
         info = ctk.CTkFrame(root, fg_color="#1f2328", corner_radius=8)
         info.pack(fill="x", padx=18, pady=4)
@@ -325,16 +306,6 @@ class HiResRecorderApp(ctk.CTk):
         )
         self.history_btn.pack(side="left", padx=(8, 0))
         
-        self.network_test_btn = ctk.CTkButton(
-            log_header,
-            text="回線実測",
-            height=24,
-            width=82,
-            command=self.run_network_preflight,
-            fg_color="#30363d",
-            hover_color="#484f58",
-        )
-        self.network_test_btn.pack(side="right")
         self.diag_btn = ctk.CTkButton(
             log_header,
             text="品質診断",
@@ -380,13 +351,6 @@ class HiResRecorderApp(ctk.CTk):
         self.mode_menu.configure(state=locked_state)
         self.provider_menu.configure(state=locked_state)
         self.diag_btn.configure(state=locked_state)
-        self.network_test_btn.configure(
-            state=(
-                "disabled"
-                if recording or self.network_test_running or self.provider.get() == PROVIDER_QOBUZ
-                else "normal"
-            )
-        )
         for entry in self.setting_entries:
             entry.configure(state=locked_state)
 
@@ -586,18 +550,12 @@ class HiResRecorderApp(ctk.CTk):
         return self.provider_adapters[self.provider.get()]
 
     def on_provider_change(self, value, refresh=True):
-        is_qobuz = value == PROVIDER_QOBUZ
-        self.qobuz_mode_label.configure(text_color="#63f08f" if is_qobuz else "#808995")
-        self.network_test_btn.configure(
-            state="disabled" if is_qobuz or self.network_test_running else "normal"
-        )
         self.standby_switch.configure(
             text=f"Standby: {value}再生で自動開始"
         )
         self.auto_stop_switch.configure(text=f"{value}停止/一時停止で自動停止")
         self.current_spotify_info = None
         self.last_track_key = None
-        self.last_network_test = None
         if refresh:
             self.refresh_source_quality_status(log_result=True)
 
@@ -668,76 +626,6 @@ class HiResRecorderApp(ctk.CTk):
             for warning in status.warnings:
                 self.log_message(f"設定警告: {warning}")
         return self.spotify_quality_settings
-
-    def run_network_preflight(self):
-        if self.provider.get() == PROVIDER_QOBUZ:
-            self.log_message("QobuzはOffline専用です。完全ダウンロード証跡を品質診断で確認してください。")
-            return
-        if self.is_recording or self.network_test_running:
-            self.log_message("録音中または実測中のため、回線実測を開始できません。")
-            return
-        self.network_test_running = True
-        self.network_test_id += 1
-        test_id = self.network_test_id
-        self.network_test_btn.configure(state="disabled", text="実測中...")
-        self.log_message("Apple networkQualityで下り回線を実測します。通信量が発生します。")
-
-        adapter = self.current_adapter()
-        self.network_test_watchdog_id = self.after(
-            NETWORK_TEST_UI_TIMEOUT_MS,
-            lambda: self.finish_network_preflight(
-                test_id,
-                adapter.name,
-                timeout=True,
-            ),
-        )
-
-        def test_thread():
-            try:
-                result = run_network_quality_test(
-                    minimum_mbps=adapter.recommended_min_mbps,
-                    provider_label=adapter.name,
-                )
-            except Exception as exc:
-                detail = str(exc) or type(exc).__name__
-                result = {"available": False, "error": f"回線実測スレッド失敗: {detail}"}
-            self.ui_queue.put(
-                lambda: self.finish_network_preflight(test_id, adapter.name, result=result)
-            )
-
-        threading.Thread(target=test_thread, daemon=True).start()
-
-    def finish_network_preflight(self, test_id, adapter_name, result=None, timeout=False):
-        if test_id != self.network_test_id or not self.network_test_running:
-            return
-
-        watchdog_id = self.network_test_watchdog_id
-        self.network_test_watchdog_id = None
-        self.network_test_running = False
-        if watchdog_id is not None:
-            try:
-                self.after_cancel(watchdog_id)
-            except TclError:
-                # 監視タイマー自身が発火中なら、取り消し対象は既に存在しない。
-                pass
-        self.network_test_btn.configure(
-            state="disabled" if self.provider.get() == PROVIDER_QOBUZ else "normal",
-            text="回線実測",
-        )
-
-        if timeout:
-            self.log_message(
-                "回線実測が45秒以内に完了しなかったため失敗扱いにしました。再実測できます。"
-            )
-            return
-
-        self.log_message(f"回線実測: {format_network_quality(result)}")
-        for warning in result.get("warnings", []):
-            self.log_message(f"回線警告: {warning}")
-        if self.provider.get() == adapter_name:
-            self.last_network_test = result
-        else:
-            self.log_message("サービス変更後に完了した回線実測結果は破棄しました。")
 
     def on_standby_toggle(self):
         self.is_standby = self.standby_switch.get() == 1
@@ -848,11 +736,7 @@ class HiResRecorderApp(ctk.CTk):
             "key": normalized_track_key(info),
             "artwork_url": info.get("artwork_url"),
             "provider": str(info.get("provider") or self.provider.get()).lower(),
-            "source_mode": (
-                QOBUZ_OFFLINE.lower()
-                if self.provider.get() == PROVIDER_QOBUZ
-                else info.get("source_mode", "streaming")
-            ),
+            "source_mode": "offline",
             "track_id": info.get("track_id"),
             "source_sample_rate": info.get("source_sample_rate"),
             "source_bit_depth": info.get("source_bit_depth"),
@@ -873,9 +757,6 @@ class HiResRecorderApp(ctk.CTk):
     def start_rec(self):
         if self.is_recording:
             return
-        if self.network_test_running:
-            self.log_message("回線実測の完了後に録音を開始してください。")
-            return
         self.update_sample_rate()
         try:
             maximum_minutes = int(self.maximum_recording_minutes.get())
@@ -885,8 +766,8 @@ class HiResRecorderApp(ctk.CTk):
         except (TclError, TypeError, ValueError) as exc:
             self.log_message(f"録音設定エラー: {exc}")
             return
-        if self.provider.get() == PROVIDER_QOBUZ and not source_evaluation["conditions_pass"]:
-            self.log_message("Qobuz厳格品質ゲートにより録音開始を拒否しました。")
+        if not source_evaluation["conditions_pass"]:
+            self.log_message(f"{self.provider.get()} Offline品質ゲートにより録音開始を拒否しました。")
             for warning in source_evaluation.get("warnings", []):
                 self.log_message(f"開始拒否: {warning}")
             return
@@ -939,20 +820,10 @@ class HiResRecorderApp(ctk.CTk):
             self.sample_rate,
             device_name,
             settings,
-            self.last_network_test,
             recording_frame_offset=self.total_samples_recorded,
             provider=self.provider.get().lower(),
             source_evaluation=source_evaluation,
         )
-        adapter = self.current_adapter()
-        self.spotify_network_monitor = None
-        if self.provider.get() != PROVIDER_QOBUZ:
-            self.spotify_network_monitor = ProcessNetworkMonitor(
-                adapter.process_prefixes,
-                adapter.name,
-            )
-            if not self.spotify_network_monitor.start():
-                self.log_message(f"{adapter.name}通信量モニターを開始できません。音声録音は継続します。")
         self.log_message(f"録音監査開始: {source_evaluation['assurance_label']}")
 
         self.spotify_idle_since = None
@@ -1014,21 +885,14 @@ class HiResRecorderApp(ctk.CTk):
                 spool_error = str(exc)
         if spool_error and self.capture_quality_audit is not None:
             self.capture_quality_audit.add_external_event("spool_overflow", spool_error)
-        network_summary = (
-            self.spotify_network_monitor.stop()
-            if self.spotify_network_monitor is not None
-            else None
-        )
         capture_audit = (
             self.capture_quality_audit.finish(
-                network_summary,
                 ended_at=capture_ended_at,
                 ended_monotonic=capture_ended_monotonic,
             )
             if self.capture_quality_audit is not None
             else None
         )
-        self.spotify_network_monitor = None
         self.capture_quality_audit = None
         if capture_audit:
             self.log_message(f"録音監査結果: {format_capture_audit(capture_audit)}")
@@ -1170,9 +1034,6 @@ class HiResRecorderApp(ctk.CTk):
         self.is_standby = False
         self.standby_switch.deselect()
         self.stop_audio_stream()
-        if self.spotify_network_monitor is not None:
-            self.spotify_network_monitor.stop()
-        self.spotify_network_monitor = None
         self.capture_quality_audit = None
         if self.capture_spool is not None:
             self.capture_spool.discard()
@@ -1708,8 +1569,6 @@ class HiResRecorderApp(ctk.CTk):
 
     def on_closing(self):
         self.stop_audio_stream()
-        if self.spotify_network_monitor is not None:
-            self.spotify_network_monitor.stop()
         if self.capture_spool is not None:
             self.capture_spool.discard()
         if self.pending_spool_audio is not None:
