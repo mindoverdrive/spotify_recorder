@@ -95,6 +95,7 @@ class FloatWavSaveTests(unittest.TestCase):
             "sample_rate": SAMPLE_RATE,
             "normalize": True,
             "target_format": "M4A",
+            "auto_flac_export": False,
         }
         if legacy_options:
             options.update(legacy_options)

@@ -52,7 +52,7 @@ class CaptureSpoolTests(unittest.TestCase):
             )
         self.assertTrue(result["ok"])
         self.assertTrue(result["same_volume"])
-        self.assertEqual(result["required_bytes"], 192000 * 60 * 2 * 4 * 2)
+        self.assertEqual(result["required_bytes"], 192000 * 60 * 2 * 4 * 3)
 
 
 class ChunkedAudioTests(unittest.TestCase):
@@ -78,7 +78,11 @@ class ChunkedAudioTests(unittest.TestCase):
                 }
                 process_and_save_candidates(
                     [candidate],
-                    {"save_dir": directory, "sample_rate": sample_rate},
+                    {
+                        "save_dir": directory,
+                        "sample_rate": sample_rate,
+                        "auto_flac_export": False,
+                    },
                     lambda _message: None,
                     None,
                 )
@@ -117,7 +121,11 @@ class ChunkedAudioTests(unittest.TestCase):
         ):
             process_and_save_candidates(
                 [candidate],
-                {"save_dir": directory, "sample_rate": 44100},
+                {
+                    "save_dir": directory,
+                    "sample_rate": 44100,
+                    "auto_flac_export": False,
+                },
                 lambda _message: None,
                 None,
             )

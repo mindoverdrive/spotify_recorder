@@ -42,15 +42,21 @@ def check_capture_disk_space(
     output_free = shutil.disk_usage(output_dir).free
     same_volume = os.stat(cache_dir).st_dev == os.stat(output_dir).st_dev
     if same_volume:
-        required_on_volume = required * 2 + int(reserve_bytes)
+        required_on_volume = required * 3 + int(reserve_bytes)
         ok = cache_free >= required_on_volume
+        cache_required = required_on_volume
+        output_required = required_on_volume
     else:
-        required_on_volume = required + int(reserve_bytes)
-        ok = cache_free >= required_on_volume and output_free >= required_on_volume
+        cache_required = required + int(reserve_bytes)
+        output_required = required * 2 + int(reserve_bytes)
+        required_on_volume = max(cache_required, output_required)
+        ok = cache_free >= cache_required and output_free >= output_required
     return {
         "ok": ok,
         "estimated_audio_bytes": required,
         "required_bytes": required_on_volume,
+        "cache_required_bytes": cache_required,
+        "output_required_bytes": output_required,
         "cache_free_bytes": cache_free,
         "output_free_bytes": output_free,
         "same_volume": same_volume,

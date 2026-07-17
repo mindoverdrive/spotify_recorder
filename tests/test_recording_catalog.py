@@ -3,9 +3,12 @@ import tempfile
 import unittest
 
 from recording_catalog import (
+    list_flac_exports,
     list_recordings,
     migrate_legacy_catalog,
+    record_flac_export,
     record_saved_recording,
+    replace_recording_file,
 )
 
 
@@ -140,6 +143,50 @@ class RecordingCatalogTests(unittest.TestCase):
         self.assertTrue(migrated)
         self.assertEqual(value, "preserved")
         self.assertTrue(source_exists)
+
+    def test_tracks_flac_export_and_replaces_history_media_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = os.path.join(directory, "recordings.sqlite3")
+            wav_path = os.path.join(directory, "Track.wav")
+            flac_path = os.path.join(directory, "Track.flac")
+            for path in (wav_path, flac_path):
+                with open(path, "wb") as handle:
+                    handle.write(b"fixture")
+            analysis = {
+                "duration_sec": 1.0,
+                "sample_rate": 44100,
+                "channels": 2,
+                "integrated_lufs": -14.0,
+                "sample_peak_dbfs": -1.0,
+                "true_peak_dbtp": -0.8,
+                "warnings": [],
+                "full_scale_ranges": [],
+            }
+            record_saved_recording(
+                wav_path,
+                {"name": "Track", "artist": "Artist", "album": "Album"},
+                analysis,
+                database_path=database_path,
+            )
+            record_flac_export(
+                wav_path,
+                flac_path,
+                "complete",
+                sample_peak_dbfs=-1.0,
+                artwork_embedded=True,
+                source_bytes=100,
+                flac_bytes=60,
+                database_path=database_path,
+            )
+            replace_recording_file(wav_path, flac_path, database_path=database_path)
+            exports = list_flac_exports("Artist", database_path=database_path)
+            recordings = list_recordings(database_path=database_path)
+
+        self.assertEqual(len(exports), 1)
+        self.assertEqual(exports[0]["dither"], "TPDF")
+        self.assertEqual(exports[0]["bit_depth"], 24)
+        self.assertEqual(exports[0]["artwork_embedded"], 1)
+        self.assertEqual(recordings[0]["file_path"], flac_path)
 
 
 if __name__ == "__main__":

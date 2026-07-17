@@ -1,15 +1,17 @@
 # Hi-Res Recorder
 
-Spotify/Qobuz Desktopの出力を、アプリ内で音量を変えずに32-bit float WAVとして記録し、録音品質と疑義箇所を管理するmacOSアプリです。Native版が正式系で、Nextは実験用プロトタイプとして残しています。
+Spotify/Qobuz Desktopの出力をアプリ内で音量を変えずに32-bit floatで記録し、TPDFディザ付き24-bit FLACへ自動変換して、録音品質と疑義箇所を管理するmacOSアプリです。Native版が正式系で、Nextは実験用プロトタイプとして残しています。
 
 録音には、音楽アプリ専用の仮想オーディオ経路を使います。LoopbackはRogue Amoeba製の有料ルーティングアプリ、BlackHoleは無料で使える仮想オーディオドライバです。Macの通常の入力1/2chを直接録音すると、通知音やブラウザなど他アプリの音が混ざる可能性があります。専用の2ch経路を用意し、SpotifyまたはQobuzだけをそこへ出力してください。
 
 ## 録音品質
 
 - `sounddevice.InputStream(dtype="float32")`からWAV保存までゲインは常時`1.0`
-- WAV 32-bit IEEE float固定。正規化、リミッター、クリップ、録音中リサンプリングなし
+- キャプチャと解析はWAV 32-bit IEEE float。正規化、リミッター、クリップ、録音中リサンプリングなし
 - 入力デバイスの実レートを維持し、最大192kHzの長時間録音をディスクスプールへ保存
-- 4GiB未満はRIFF WAV、長大な単一曲はRF64 WAVへ自動切替
+- WAVから24-bit FLACへ変換する際はピーク±1 LSB（2 LSB peak-to-peak）のTPDFディザを使用
+- 変換後のFLACを再読込し、形式、レート、チャンネル数、フレーム数、有限値、タグ、ジャケット画像を検証
+- 検証成功時だけ一時WAVを自動削除。Sample Peakが0dBFSを超える場合や変換・検証失敗時はFLAC化を拒否してWAVを保持
 - Integrated LUFS、Sample Peak、4倍True Peak、0dBFS到達位置をチャンク解析
 - PortAudio異常、フレーム不足、0.5秒以上の無音、同一ブロック反復、境界不連続、再生停止、タイムライン滑りを記録
 - 音声波形や通信量だけからLosslessを断定せず、常に「bit一致未証明」と表示
@@ -46,6 +48,7 @@ uv run python spotify_recorder.py
 5. macOSからマイク（オーディオ入力）権限を求められたら許可します。アプリのInput Deviceで専用経路を選び、左右の開始チャンネルがその経路のステレオ2chと一致することを確認します。
 6. 音楽サービス側の音量は100%にし、EQ、Crossfade、Automix、音量の均一化はOFFにします。QobuzではExclusive ModeをONにします。
 7. まず短いテスト録音を行います。レビューで入力レート、LUFS、Peak、True Peak、疑義イベントを確認し、通知音や別アプリの音が混ざっていないことを再生して確かめます。問題があれば録音せず、ルーティングを修正します。
+8. 「録音/FLAC」からFLAC管理タブを開き、変換結果、WAV削除状態、ジャケット埋め込み、容量を確認します。拒否・失敗時はWAVが残るため、原因を解消してから再実行できます。
 
 ### 録音時の判断
 
@@ -79,7 +82,7 @@ Qobuzは音量100%、Exclusive Mode ON、最高配信品質を使用してくだ
 
 ## 履歴と復旧
 
-保存曲、サービス、Qobuz曲ID、ソース形式、LUFS、Peak、True Peak、品質合否、疑義時刻、再録要否をSQLiteへ保存します。履歴画面から検索、サービス/再録状態の絞り込み、疑義箇所の試聴ができます。
+保存曲、サービス、Qobuz曲ID、ソース形式、LUFS、Peak、True Peak、品質合否、疑義時刻、再録要否をSQLiteへ保存します。管理画面は録音履歴とFLAC管理の2タブで、変換状態、拒否理由、ジャケット埋め込み、WAV削除結果、容量も確認できます。
 
 ```text
 ~/Library/Application Support/HiResRecorder/recordings.sqlite3

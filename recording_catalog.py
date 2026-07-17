@@ -4,7 +4,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def legacy_catalog_path():
@@ -134,6 +134,33 @@ def _connect(database_path):
             FOREIGN KEY(recording_id) REFERENCES recordings(id) ON DELETE CASCADE
         )
         """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flac_exports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recording_id INTEGER,
+            source_wav_path TEXT NOT NULL UNIQUE,
+            flac_path TEXT,
+            status TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            bit_depth INTEGER NOT NULL DEFAULT 24,
+            dither TEXT NOT NULL DEFAULT 'TPDF',
+            sample_peak_dbfs REAL,
+            artwork_embedded INTEGER,
+            source_bytes INTEGER,
+            flac_bytes INTEGER,
+            wav_deleted INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(recording_id) REFERENCES recordings(id) ON DELETE SET NULL
+        )
+        """
+    )
+    _ensure_columns(
+        connection,
+        "flac_exports",
+        {"wav_deleted": "INTEGER NOT NULL DEFAULT 0"},
     )
     connection.execute(
         """
@@ -332,6 +359,139 @@ def record_saved_recording(
                     json.dumps(event, ensure_ascii=False),
                 ),
             )
+    return recording_id
+
+
+def record_flac_export(
+    source_wav_path,
+    flac_path,
+    status,
+    reason="",
+    sample_peak_dbfs=None,
+    artwork_embedded=None,
+    source_bytes=None,
+    flac_bytes=None,
+    wav_deleted=False,
+    database_path=None,
+):
+    source_path = os.path.abspath(os.path.expanduser(source_wav_path))
+    output_path = (
+        os.path.abspath(os.path.expanduser(flac_path)) if flac_path else None
+    )
+    target = database_path or default_catalog_path()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _connect(target) as connection:
+        row = connection.execute(
+            "SELECT id FROM recordings WHERE file_path = ?", (source_path,)
+        ).fetchone()
+        if row:
+            recording_id = row[0]
+        else:
+            existing = connection.execute(
+                "SELECT recording_id FROM flac_exports WHERE source_wav_path = ?",
+                (source_path,),
+            ).fetchone()
+            recording_id = existing[0] if existing else None
+        connection.execute(
+            """
+            INSERT INTO flac_exports (
+                recording_id, source_wav_path, flac_path, status, reason,
+                bit_depth, dither, sample_peak_dbfs, artwork_embedded,
+                source_bytes, flac_bytes, wav_deleted, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 24, 'TPDF', ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_wav_path) DO UPDATE SET
+                recording_id=excluded.recording_id,
+                flac_path=excluded.flac_path,
+                status=excluded.status,
+                reason=excluded.reason,
+                bit_depth=excluded.bit_depth,
+                dither=excluded.dither,
+                sample_peak_dbfs=excluded.sample_peak_dbfs,
+                artwork_embedded=excluded.artwork_embedded,
+                source_bytes=excluded.source_bytes,
+                flac_bytes=excluded.flac_bytes,
+                wav_deleted=excluded.wav_deleted,
+                updated_at=excluded.updated_at
+            """,
+            (
+                recording_id,
+                source_path,
+                output_path,
+                str(status),
+                str(reason or ""),
+                sample_peak_dbfs,
+                None if artwork_embedded is None else int(bool(artwork_embedded)),
+                source_bytes,
+                flac_bytes,
+                int(bool(wav_deleted)),
+                now,
+                now,
+            ),
+        )
+
+
+def replace_recording_file(source_wav_path, flac_path, database_path=None):
+    source_path = os.path.abspath(os.path.expanduser(source_wav_path))
+    output_path = os.path.abspath(os.path.expanduser(flac_path))
+    target = database_path or default_catalog_path()
+    with _connect(target) as connection:
+        row = connection.execute(
+            "SELECT recording_id FROM flac_exports WHERE source_wav_path = ?",
+            (source_path,),
+        ).fetchone()
+        recording_id = row[0] if row else None
+        if recording_id is None:
+            row = connection.execute(
+                "SELECT id FROM recordings WHERE file_path = ?", (source_path,)
+            ).fetchone()
+            recording_id = row[0] if row else None
+        if recording_id is not None:
+            connection.execute(
+                "UPDATE recordings SET file_path = ?, file_name = ? WHERE id = ?",
+                (output_path, os.path.basename(output_path), recording_id),
+            )
+            connection.execute(
+                "UPDATE flac_exports SET recording_id = ? WHERE source_wav_path = ?",
+                (recording_id, source_path),
+            )
+
+
+def list_flac_exports(
+    query="",
+    status=None,
+    limit=500,
+    database_path=None,
+):
+    target = database_path or default_catalog_path()
+    search = f"%{query.strip()}%"
+    conditions = [
+        "(:query = '' OR r.title LIKE :search COLLATE NOCASE "
+        "OR r.artist LIKE :search COLLATE NOCASE "
+        "OR r.album LIKE :search COLLATE NOCASE "
+        "OR e.source_wav_path LIKE :search COLLATE NOCASE "
+        "OR e.flac_path LIKE :search COLLATE NOCASE)"
+    ]
+    parameters = {"query": query.strip(), "search": search, "limit": int(limit)}
+    if status:
+        conditions.append("e.status = :status")
+        parameters["status"] = str(status)
+    sql = (
+        "SELECT e.*, r.title, r.artist, r.album, r.provider, r.source_mode "
+        "FROM flac_exports e LEFT JOIN recordings r ON r.id = e.recording_id WHERE "
+        + " AND ".join(conditions)
+        + " ORDER BY e.updated_at DESC, e.id DESC LIMIT :limit"
+    )
+    with _connect(target) as connection:
+        rows = connection.execute(sql, parameters).fetchall()
+    exports = []
+    for row in rows:
+        item = dict(row)
+        item["source_exists"] = os.path.isfile(item["source_wav_path"])
+        item["flac_exists"] = bool(
+            item.get("flac_path") and os.path.isfile(item["flac_path"])
+        )
+        exports.append(item)
+    return exports
 
 
 def list_recordings(

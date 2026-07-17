@@ -7,6 +7,7 @@ customtkinter_data = collect_data_files("customtkinter")
 hidden_imports = (
     [
         "soundfile",
+        "mutagen.flac",
         "pyloudnorm",
         "scipy.signal",
         "qobuz_integration",
@@ -61,11 +62,11 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="Hi-Res Recorder.app",
-    version="4.0.0",
+    version="4.1.0",
     bundle_identifier="local.hires-recorder.native",
     info_plist={
         "CFBundleDisplayName": "Hi-Res Recorder",
-        "NSMicrophoneUsageDescription": "システム音声を高品質WAVとして録音するためにオーディオ入力へのアクセスが必要です。",
+        "NSMicrophoneUsageDescription": "システム音声を高品質FLACとして記録するためにオーディオ入力へのアクセスが必要です。",
         "NSAppleEventsUsageDescription": "Spotifyモードで再生中の曲情報を取得するためにアクセスが必要です。",
     },
 )

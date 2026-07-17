@@ -19,7 +19,7 @@ from capture_spool import (
     list_recoverable_sessions,
 )
 from coreaudio_devices import resolve_coreaudio_device
-from recording_catalog import default_catalog_path, list_recordings
+from recording_catalog import default_catalog_path, list_flac_exports, list_recordings
 from spotify_recorder_services import (
     MODE_PRESETS,
     MODE_ALBUM,
@@ -31,6 +31,7 @@ from spotify_recorder_services import (
     normalized_track_key,
     prepare_track_candidates,
     process_and_save_candidates,
+    retry_flac_export,
 )
 from spotify_quality_audit import (
     CaptureQualityAudit,
@@ -220,7 +221,7 @@ class HiResRecorderApp(ctk.CTk):
 
         self.quality_label = ctk.CTkLabel(
             controls_frame,
-            text="WAV 32-bit float / Unity Gain / LUFS解析のみ",
+            text="WAV FLOAT capture -> FLAC 24-bit TPDF / Unity Gain",
             fg_color="#252b33",
             corner_radius=5,
         )
@@ -332,7 +333,7 @@ class HiResRecorderApp(ctk.CTk):
         ctk.CTkLabel(log_header, text="Log", text_color="#b7bec8").pack(side="left")
         self.history_btn = ctk.CTkButton(
             log_header,
-            text="録音履歴",
+            text="録音/FLAC",
             height=24,
             width=82,
             command=self.show_recording_history,
@@ -843,7 +844,7 @@ class HiResRecorderApp(ctk.CTk):
             self.stream.start()
             self.log_message(
                 f"Audio stream started: {self.sample_rate}Hz / ch {start_ch}-{start_ch + 1} / "
-                "Unity Gain 1.0 / WAV 32-bit float"
+                "Unity Gain 1.0 / WAV FLOAT capture -> FLAC 24-bit TPDF"
             )
             if self.sample_rate != DEFAULT_SAMPLE_RATE:
                 self.log_message(
@@ -1213,13 +1214,18 @@ class HiResRecorderApp(ctk.CTk):
 
     def show_recording_history(self):
         history_win = ctk.CTkToplevel(self)
-        history_win.title("録音履歴")
-        history_win.geometry("920x650")
-        history_win.minsize(760, 520)
+        history_win.title("録音・FLAC管理")
+        history_win.geometry("980x700")
+        history_win.minsize(820, 560)
         history_win.transient(self)
 
-        toolbar = ctk.CTkFrame(history_win, fg_color="transparent")
-        toolbar.pack(fill="x", padx=18, pady=(14, 8))
+        tabs = ctk.CTkTabview(history_win)
+        tabs.pack(fill="both", expand=True, padx=12, pady=12)
+        recordings_tab = tabs.add("録音履歴")
+        flac_tab = tabs.add("FLAC管理")
+
+        toolbar = ctk.CTkFrame(recordings_tab, fg_color="transparent")
+        toolbar.pack(fill="x", padx=10, pady=(8, 8))
         query_var = ctk.StringVar()
         provider_filter = ctk.StringVar(value="すべて")
         verdict_filter = ctk.StringVar(value="すべて")
@@ -1232,8 +1238,8 @@ class HiResRecorderApp(ctk.CTk):
         count_label = ctk.CTkLabel(toolbar, text="")
         count_label.pack(side="right", padx=(10, 0))
 
-        filter_bar = ctk.CTkFrame(history_win, fg_color="transparent")
-        filter_bar.pack(fill="x", padx=18, pady=(0, 8))
+        filter_bar = ctk.CTkFrame(recordings_tab, fg_color="transparent")
+        filter_bar.pack(fill="x", padx=10, pady=(0, 8))
         ctk.CTkLabel(filter_bar, text="サービス").pack(side="left")
         ctk.CTkSegmentedButton(
             filter_bar,
@@ -1249,8 +1255,8 @@ class HiResRecorderApp(ctk.CTk):
             command=lambda _value: render(),
         ).pack(side="left", padx=8)
 
-        scroll = ctk.CTkScrollableFrame(history_win, fg_color="#11151a")
-        scroll.pack(fill="both", expand=True, padx=18, pady=(0, 14))
+        scroll = ctk.CTkScrollableFrame(recordings_tab, fg_color="#11151a")
+        scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         def open_recording(path):
             if os.path.isfile(path):
@@ -1416,6 +1422,186 @@ class HiResRecorderApp(ctk.CTk):
         ctk.CTkButton(toolbar, text="検索", width=70, command=render).pack(side="left", padx=(8, 0))
         search_entry.bind("<Return>", render)
         render()
+
+        flac_toolbar = ctk.CTkFrame(flac_tab, fg_color="transparent")
+        flac_toolbar.pack(fill="x", padx=10, pady=(8, 8))
+        flac_query_var = ctk.StringVar()
+        flac_status_filter = ctk.StringVar(value="すべて")
+        flac_search_entry = ctk.CTkEntry(
+            flac_toolbar,
+            textvariable=flac_query_var,
+            placeholder_text="曲名・アーティスト・WAV/FLACファイル名",
+        )
+        flac_search_entry.pack(side="left", fill="x", expand=True)
+        flac_count_label = ctk.CTkLabel(flac_toolbar, text="")
+        flac_count_label.pack(side="right", padx=(10, 0))
+
+        flac_filter_bar = ctk.CTkFrame(flac_tab, fg_color="transparent")
+        flac_filter_bar.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkLabel(flac_filter_bar, text="状態").pack(side="left")
+        ctk.CTkSegmentedButton(
+            flac_filter_bar,
+            values=["すべて", "完了", "拒否", "失敗"],
+            variable=flac_status_filter,
+            command=lambda _value: render_flac(),
+        ).pack(side="left", padx=8)
+        ctk.CTkLabel(
+            flac_filter_bar,
+            text="成功時のみ検証後にWAVを自動削除",
+            text_color="#aab2bd",
+        ).pack(side="right")
+
+        flac_scroll = ctk.CTkScrollableFrame(flac_tab, fg_color="#11151a")
+        flac_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        def retry_export(item):
+            if self.is_recording or not item.get("source_exists"):
+                return
+            self.log_message(
+                f"FLAC再変換開始: {os.path.basename(item['source_wav_path'])}"
+            )
+
+            def worker():
+                retry_flac_export(item, self.catalog_path, self.log_message)
+                self.after(0, render_flac)
+                self.after(0, render)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def render_flac(_event=None):
+            for child in flac_scroll.winfo_children():
+                child.destroy()
+            try:
+                exports = list_flac_exports(
+                    flac_query_var.get(),
+                    database_path=self.catalog_path,
+                )
+                selected_status = flac_status_filter.get()
+                if selected_status == "完了":
+                    exports = [item for item in exports if item["status"].startswith("complete")]
+                elif selected_status == "拒否":
+                    exports = [item for item in exports if item["status"] == "rejected"]
+                elif selected_status == "失敗":
+                    exports = [item for item in exports if item["status"] == "failed"]
+            except Exception as exc:
+                flac_count_label.configure(text="読込エラー")
+                ctk.CTkLabel(flac_scroll, text=str(exc), text_color="#ff5964").pack(
+                    pady=20
+                )
+                return
+            flac_count_label.configure(text=f"{len(exports)}件")
+            if not exports:
+                ctk.CTkLabel(
+                    flac_scroll,
+                    text="該当するFLAC変換はありません",
+                    text_color="#808995",
+                ).pack(pady=24)
+                return
+
+            status_labels = {
+                "complete": ("完了・WAV削除済み", "#63f08f"),
+                "complete_wav_retained": ("完了・WAV残存", "#f0b429"),
+                "converting": ("変換中", "#58a6ff"),
+                "rejected": ("拒否", "#ff5964"),
+                "failed": ("失敗", "#ff5964"),
+            }
+            for item in exports:
+                row = ctk.CTkFrame(flac_scroll, corner_radius=6)
+                row.pack(fill="x", padx=4, pady=4)
+                row.grid_columnconfigure(0, weight=1)
+                status_text, status_color = status_labels.get(
+                    item["status"], (item["status"], "#f0b429")
+                )
+                title = (
+                    f"{item.get('artist') or 'Unknown'} - "
+                    f"{item.get('title') or os.path.basename(item['source_wav_path'])}"
+                )
+                source_bytes = int(item.get("source_bytes") or 0)
+                flac_bytes = int(item.get("flac_bytes") or 0)
+                size_text = ""
+                if source_bytes and flac_bytes:
+                    ratio = 100.0 * flac_bytes / source_bytes
+                    size_text = (
+                        f" / {flac_bytes / 1024**2:.1f} MiB "
+                        f"({ratio:.1f}% of WAV)"
+                    )
+                artwork_text = (
+                    "ジャケット埋込済み"
+                    if item.get("artwork_embedded")
+                    else "ジャケットなし"
+                )
+                details = (
+                    f"24-bit FLAC / {item.get('dither') or 'TPDF'}{size_text} / "
+                    f"{artwork_text}"
+                )
+                ctk.CTkLabel(
+                    row,
+                    text=title,
+                    anchor="w",
+                    font=ctk.CTkFont(size=14, weight="bold"),
+                ).grid(row=0, column=0, sticky="ew", padx=12, pady=(9, 0))
+                ctk.CTkLabel(row, text=status_text, text_color=status_color).grid(
+                    row=0, column=1, sticky="e", padx=10, pady=(9, 0)
+                )
+                ctk.CTkLabel(
+                    row,
+                    text=details,
+                    anchor="w",
+                    text_color="#aab2bd",
+                ).grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 7))
+                if item.get("reason"):
+                    ctk.CTkLabel(
+                        row,
+                        text=item["reason"],
+                        anchor="w",
+                        justify="left",
+                        text_color="#ff9b9b",
+                        wraplength=650,
+                    ).grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
+
+                button_frame = ctk.CTkFrame(row, fg_color="transparent")
+                button_frame.grid(row=1, column=1, rowspan=2, sticky="e", padx=8, pady=6)
+                flac_state = "normal" if item.get("flac_exists") else "disabled"
+                ctk.CTkButton(
+                    button_frame,
+                    text="再生",
+                    width=56,
+                    height=26,
+                    state=flac_state,
+                    command=lambda path=item.get("flac_path"): open_recording(path),
+                ).pack(side="left", padx=3)
+                ctk.CTkButton(
+                    button_frame,
+                    text="Finder",
+                    width=62,
+                    height=26,
+                    state=flac_state,
+                    command=lambda path=item.get("flac_path"): reveal_recording(path),
+                ).pack(side="left", padx=3)
+                retry_state = (
+                    "normal"
+                    if item["status"] in {"failed", "rejected"}
+                    and item.get("source_exists")
+                    and not self.is_recording
+                    else "disabled"
+                )
+                ctk.CTkButton(
+                    button_frame,
+                    text="再実行",
+                    width=62,
+                    height=26,
+                    state=retry_state,
+                    command=lambda target=item: retry_export(target),
+                ).pack(side="left", padx=3)
+
+        ctk.CTkButton(
+            flac_toolbar,
+            text="検索",
+            width=70,
+            command=render_flac,
+        ).pack(side="left", padx=(8, 0))
+        flac_search_entry.bind("<Return>", render_flac)
+        render_flac()
 
     def on_processing_finished(self):
         if self.pending_spool_audio is not None:
