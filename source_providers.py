@@ -24,6 +24,14 @@ PROVIDERS = [PROVIDER_SPOTIFY, PROVIDER_QOBUZ]
 QOBUZ_OFFLINE = "Offline"
 
 
+def source_is_playing(snapshot):
+    """Return whether a provider snapshot represents active playback."""
+    return (
+        snapshot.get("status") == "OK"
+        and str(snapshot.get("state", "")).lower() == "playing"
+    )
+
+
 @dataclass
 class ProviderStatus:
     provider: str

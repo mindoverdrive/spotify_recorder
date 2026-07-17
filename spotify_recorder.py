@@ -44,6 +44,7 @@ from source_providers import (
     PROVIDER_SPOTIFY,
     PROVIDERS,
     create_provider_adapters,
+    source_is_playing,
 )
 
 CHECK_INTERVAL_MS = 800
@@ -72,9 +73,9 @@ class HiResRecorderApp(ctk.CTk):
         self.pre_samples = 0
         self.total_samples_recorded = 0
         self.recording_history = []
-        self.current_spotify_info = None
+        self.current_source_info = None
         self.last_track_key = None
-        self.spotify_idle_since = None
+        self.source_idle_since = None
         self.latest_level = 0.0
         self._stream_start_ch = 1
         self.spotify_quality_settings = {"available": False}
@@ -203,16 +204,22 @@ class HiResRecorderApp(ctk.CTk):
 
         switches = ctk.CTkFrame(root, fg_color="transparent")
         switches.pack(fill="x", padx=18, pady=4)
+        self.automation_provider_label = ctk.CTkLabel(
+            switches,
+            text="監視対象: Spotify Offline",
+            text_color="#63f08f",
+        )
+        self.automation_provider_label.pack(anchor="w", pady=(0, 2))
         self.standby_switch = ctk.CTkSwitch(
             switches,
-            text="Standby: ソース再生で自動開始",
+            text="Standby (Spotify / Qobuz): 選択中サービスの再生で自動開始",
             progress_color="#1DB954",
             command=self.on_standby_toggle,
         )
         self.standby_switch.pack(anchor="w", pady=2)
         self.auto_stop_switch = ctk.CTkSwitch(
             switches,
-            text="ソース停止/一時停止で自動停止",
+            text="自動停止 (Spotify / Qobuz): 選択中サービスの停止・一時停止を検知",
             variable=self.auto_stop_on_idle,
             progress_color="#1DB954",
         )
@@ -550,12 +557,15 @@ class HiResRecorderApp(ctk.CTk):
         return self.provider_adapters[self.provider.get()]
 
     def on_provider_change(self, value, refresh=True):
-        self.standby_switch.configure(
-            text=f"Standby: {value}再生で自動開始"
-        )
-        self.auto_stop_switch.configure(text=f"{value}停止/一時停止で自動停止")
-        self.current_spotify_info = None
+        self.automation_provider_label.configure(text=f"監視対象: {value} Offline")
+        self.current_source_info = None
+        self.source_idle_since = None
         self.last_track_key = None
+        if self.is_standby:
+            with self.audio_lock:
+                self.pre_chunks = []
+                self.pre_samples = 0
+            self.log_message(f"Standby監視対象を{value} Offlineへ変更しました。")
         if refresh:
             self.refresh_source_quality_status(log_result=True)
 
@@ -826,16 +836,16 @@ class HiResRecorderApp(ctk.CTk):
         )
         self.log_message(f"録音監査開始: {source_evaluation['assurance_label']}")
 
-        self.spotify_idle_since = None
+        self.source_idle_since = None
         self.recording_history = []
         self.last_track_key = None
-        if self.current_spotify_info and self.current_spotify_info.get("status") == "OK":
-            self.add_history_track(self.current_spotify_info, 0)
+        if self.current_source_info and self.current_source_info.get("status") == "OK":
+            self.add_history_track(self.current_source_info, 0)
             self.status_label.configure(
-                text=f"Recording: {self.current_spotify_info['name']}",
+                text=f"Recording: {self.current_source_info['name']}",
                 text_color="#e91429",
             )
-            self.log_message(f"録音開始: {self.current_spotify_info['artist']} - {self.current_spotify_info['name']}")
+            self.log_message(f"録音開始: {self.current_source_info['artist']} - {self.current_source_info['name']}")
         else:
             self.recording_history.append(
                 {
@@ -858,7 +868,7 @@ class HiResRecorderApp(ctk.CTk):
 
         stop_info = self.current_adapter().snapshot()
         if stop_info.get("status") != "OK":
-            stop_info = self.current_spotify_info
+            stop_info = self.current_source_info
         elif normalized_track_key(stop_info) != self.last_track_key and self.last_track_key is not None:
             estimated_start = self.estimate_track_start_sample(stop_info)
             self.add_history_track(stop_info, estimated_start)
@@ -1465,7 +1475,7 @@ class HiResRecorderApp(ctk.CTk):
     def poll_source(self):
         adapter = self.current_adapter()
         info = adapter.snapshot()
-        self.current_spotify_info = info
+        self.current_source_info = info
 
         if self.is_recording and self.capture_quality_audit is not None:
             for event in adapter.poll_events():
@@ -1502,7 +1512,7 @@ class HiResRecorderApp(ctk.CTk):
                     duration=info.get("duration"),
                 )
 
-            if self.is_standby and not self.is_recording and info.get("state") == "playing":
+            if self.is_standby and not self.is_recording and source_is_playing(info):
                 self.log_message(f"{adapter.name}再生検知: {info['artist']} - {info['name']}")
                 self.start_rec()
                 
@@ -1514,16 +1524,16 @@ class HiResRecorderApp(ctk.CTk):
                         self.stop_rec()
 
             if self.is_recording and self.auto_stop_on_idle.get():
-                if info.get("state") != "playing":
-                    if self.spotify_idle_since is None:
-                        self.spotify_idle_since = time.time()
-                    elif time.time() - self.spotify_idle_since >= float(self.auto_stop_grace_sec.get()):
+                if not source_is_playing(info):
+                    if self.source_idle_since is None:
+                        self.source_idle_since = time.time()
+                    elif time.time() - self.source_idle_since >= float(self.auto_stop_grace_sec.get()):
                         self.log_message(f"{adapter.name}自動停止検知")
                         self.stop_rec()
                 else:
-                    self.spotify_idle_since = None
+                    self.source_idle_since = None
 
-            if self.is_recording and info.get("state") == "playing":
+            if self.is_recording and source_is_playing(info):
                 if self.provider.get() == PROVIDER_QOBUZ:
                     expected_rate = self.capture_quality_audit.source_evaluation.get(
                         "source_sample_rate"
@@ -1559,9 +1569,9 @@ class HiResRecorderApp(ctk.CTk):
             self.artist_label.configure(text="-", text_color="#b7bec8")
 
             if self.is_recording and self.auto_stop_on_idle.get():
-                if self.spotify_idle_since is None:
-                    self.spotify_idle_since = time.time()
-                elif time.time() - self.spotify_idle_since >= float(self.auto_stop_grace_sec.get()):
+                if self.source_idle_since is None:
+                    self.source_idle_since = time.time()
+                elif time.time() - self.source_idle_since >= float(self.auto_stop_grace_sec.get()):
                     self.log_message(f"{adapter.name}終了検知、録音停止")
                     self.stop_rec()
 

@@ -62,7 +62,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="Hi-Res Recorder.app",
-    version="4.2.0",
+    version="4.2.1",
     bundle_identifier="local.hires-recorder.native",
     info_plist={
         "CFBundleDisplayName": "Hi-Res Recorder",

@@ -11,7 +11,7 @@ from qobuz_integration import (
     get_qobuz_snapshot,
     parse_qobuz_player_state,
 )
-from source_providers import QobuzSourceAdapter
+from source_providers import QobuzSourceAdapter, source_is_playing
 
 
 def create_qobuz_fixture(directory, completed=1, sample_rate=96000):
@@ -76,6 +76,7 @@ class QobuzStateTests(unittest.TestCase):
         self.assertTrue(snapshot["is_completed"])
         self.assertTrue(snapshot["exclusive_mode"])
         self.assertEqual(snapshot["volume_percent"], 100.0)
+        self.assertTrue(source_is_playing(snapshot))
 
         with tempfile.TemporaryDirectory() as directory:
             create_qobuz_fixture(directory)
@@ -101,6 +102,15 @@ class QobuzStateTests(unittest.TestCase):
         self.assertEqual(result["artist"], "Artist")
         self.assertEqual(result["album"], "Album")
         self.assertEqual(result["volume_percent"], 100.0)
+        self.assertFalse(source_is_playing(result))
+
+    def test_playback_automation_recognizes_qobuz_pause_and_stop(self):
+        base = {"status": "OK", "provider": "qobuz"}
+
+        self.assertTrue(source_is_playing({**base, "state": "playing"}))
+        self.assertFalse(source_is_playing({**base, "state": "paused"}))
+        self.assertFalse(source_is_playing({**base, "state": "stopped"}))
+        self.assertFalse(source_is_playing({"status": "UNAVAILABLE", "state": "playing"}))
 
 
 class QobuzGateTests(unittest.TestCase):
