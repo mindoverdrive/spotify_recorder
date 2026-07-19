@@ -4,7 +4,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def legacy_catalog_path():
@@ -220,6 +220,70 @@ def _connect(database_path):
             value TEXT NOT NULL
         )
         """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS library_jobs (
+            job_id TEXT PRIMARY KEY,
+            source_root TEXT NOT NULL,
+            destination_root TEXT NOT NULL,
+            status TEXT NOT NULL,
+            total_files INTEGER NOT NULL DEFAULT 0,
+            completed_files INTEGER NOT NULL DEFAULT 0,
+            duplicate_files INTEGER NOT NULL DEFAULT 0,
+            skipped_files INTEGER NOT NULL DEFAULT 0,
+            failed_files INTEGER NOT NULL DEFAULT 0,
+            projected_bytes INTEGER NOT NULL DEFAULT 0,
+            settings_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS library_assets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            output_path TEXT,
+            status TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            source_size INTEGER,
+            source_mtime_ns INTEGER,
+            source_sha256 TEXT,
+            pcm_sha256 TEXT,
+            source_codec TEXT,
+            source_lossless INTEGER,
+            source_sample_rate INTEGER,
+            source_bit_depth TEXT,
+            source_channels INTEGER,
+            duration_sec REAL,
+            output_bytes INTEGER,
+            dither TEXT,
+            src_engine TEXT,
+            safety_gain_db REAL,
+            artwork_embedded INTEGER,
+            processing_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(job_id) REFERENCES library_jobs(job_id) ON DELETE CASCADE,
+            UNIQUE(job_id, source_path)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_library_assets_status "
+        "ON library_assets(job_id, status)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_library_assets_source_hash "
+        "ON library_assets(source_sha256, status)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_library_assets_pcm_hash "
+        "ON library_assets(pcm_sha256, source_sample_rate, source_channels, status)"
     )
     connection.execute(
         "INSERT OR REPLACE INTO schema_metadata(key, value) VALUES('version', ?)",
@@ -689,3 +753,218 @@ def list_recordings(
         item["file_exists"] = os.path.isfile(item["file_path"])
         recordings.append(item)
     return recordings
+
+
+def create_library_job(
+    job_id,
+    source_root,
+    destination_root,
+    total_files=0,
+    projected_bytes=0,
+    settings=None,
+    database_path=None,
+):
+    target = database_path or default_catalog_path()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _connect(target) as connection:
+        connection.execute(
+            """
+            INSERT INTO library_jobs (
+                job_id, source_root, destination_root, status, total_files,
+                projected_bytes, settings_json, created_at, updated_at
+            ) VALUES (?, ?, ?, 'scanned', ?, ?, ?, ?, ?)
+            """,
+            (
+                str(job_id),
+                os.path.abspath(os.path.expanduser(source_root)),
+                os.path.abspath(os.path.expanduser(destination_root)),
+                int(total_files),
+                int(projected_bytes),
+                json.dumps(settings or {}, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+    return str(job_id)
+
+
+def update_library_job(job_id, status=None, database_path=None, **counts):
+    target = database_path or default_catalog_path()
+    allowed = {
+        "total_files",
+        "completed_files",
+        "duplicate_files",
+        "skipped_files",
+        "failed_files",
+        "projected_bytes",
+    }
+    assignments = []
+    values = []
+    if status is not None:
+        assignments.append("status = ?")
+        values.append(str(status))
+    for key, value in counts.items():
+        if key in allowed:
+            assignments.append(f"{key} = ?")
+            values.append(int(value))
+    assignments.append("updated_at = ?")
+    values.append(datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    values.append(str(job_id))
+    with _connect(target) as connection:
+        connection.execute(
+            f"UPDATE library_jobs SET {', '.join(assignments)} WHERE job_id = ?",
+            values,
+        )
+
+
+def upsert_library_asset(job_id, source_path, relative_path, database_path=None, **fields):
+    target = database_path or default_catalog_path()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    allowed = {
+        "output_path",
+        "status",
+        "reason",
+        "source_size",
+        "source_mtime_ns",
+        "source_sha256",
+        "pcm_sha256",
+        "source_codec",
+        "source_lossless",
+        "source_sample_rate",
+        "source_bit_depth",
+        "source_channels",
+        "duration_sec",
+        "output_bytes",
+        "dither",
+        "src_engine",
+        "safety_gain_db",
+        "artwork_embedded",
+        "processing_json",
+    }
+    payload = {key: value for key, value in fields.items() if key in allowed}
+    payload.setdefault("status", "queued")
+    if isinstance(payload.get("processing_json"), (dict, list)):
+        payload["processing_json"] = json.dumps(
+            payload["processing_json"], ensure_ascii=False
+        )
+    if payload.get("source_lossless") is not None:
+        payload["source_lossless"] = int(bool(payload["source_lossless"]))
+    if payload.get("artwork_embedded") is not None:
+        payload["artwork_embedded"] = int(bool(payload["artwork_embedded"]))
+    columns = ["job_id", "source_path", "relative_path", *payload, "created_at", "updated_at"]
+    values = [
+        str(job_id),
+        os.path.abspath(os.path.expanduser(source_path)),
+        str(relative_path),
+        *payload.values(),
+        now,
+        now,
+    ]
+    updates = [
+        f"{column}=excluded.{column}"
+        for column in ["relative_path", *payload, "updated_at"]
+    ]
+    placeholders = ", ".join("?" for _ in columns)
+    with _connect(target) as connection:
+        connection.execute(
+            f"""
+            INSERT INTO library_assets ({', '.join(columns)})
+            VALUES ({placeholders})
+            ON CONFLICT(job_id, source_path) DO UPDATE SET {', '.join(updates)}
+            """,
+            values,
+        )
+
+
+def find_library_duplicate(
+    source_sha256=None,
+    pcm_sha256=None,
+    source_sample_rate=None,
+    source_channels=None,
+    exclude_source_path=None,
+    database_path=None,
+):
+    target = database_path or default_catalog_path()
+    conditions = ["status = 'complete'", "output_path IS NOT NULL"]
+    parameters = []
+    hashes = []
+    if source_sha256:
+        hashes.append("source_sha256 = ?")
+        parameters.append(str(source_sha256))
+    if pcm_sha256 and source_sample_rate and source_channels:
+        hashes.append(
+            "(pcm_sha256 = ? AND source_sample_rate = ? AND source_channels = ?)"
+        )
+        parameters.extend(
+            [str(pcm_sha256), int(source_sample_rate), int(source_channels)]
+        )
+    if not hashes:
+        return None
+    conditions.append("(" + " OR ".join(hashes) + ")")
+    if exclude_source_path:
+        conditions.append("source_path != ?")
+        parameters.append(os.path.abspath(os.path.expanduser(exclude_source_path)))
+    with _connect(target) as connection:
+        row = connection.execute(
+            "SELECT * FROM library_assets WHERE "
+            + " AND ".join(conditions)
+            + " ORDER BY id LIMIT 1",
+            parameters,
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_library_jobs(limit=50, database_path=None):
+    target = database_path or default_catalog_path()
+    with _connect(target) as connection:
+        rows = connection.execute(
+            "SELECT * FROM library_jobs ORDER BY updated_at DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["settings"] = json.loads(item.pop("settings_json") or "{}")
+        result.append(item)
+    return result
+
+
+def list_library_assets(job_id, statuses=None, limit=5000, database_path=None):
+    target = database_path or default_catalog_path()
+    parameters = [str(job_id)]
+    condition = "job_id = ?"
+    if statuses:
+        values = [str(item) for item in statuses]
+        condition += " AND status IN (" + ",".join("?" for _ in values) + ")"
+        parameters.extend(values)
+    parameters.append(int(limit))
+    with _connect(target) as connection:
+        rows = connection.execute(
+            f"SELECT * FROM library_assets WHERE {condition} ORDER BY id LIMIT ?",
+            parameters,
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["processing"] = json.loads(item.pop("processing_json") or "{}")
+        item["output_exists"] = bool(
+            item.get("output_path") and os.path.isfile(item["output_path"])
+        )
+        result.append(item)
+    return result
+
+
+def recover_interrupted_library_jobs(database_path=None):
+    target = database_path or default_catalog_path()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _connect(target) as connection:
+        connection.execute(
+            "UPDATE library_assets SET status='queued', reason='前回の変換中断から再開', "
+            "updated_at=? WHERE status='converting'",
+            (now,),
+        )
+        connection.execute(
+            "UPDATE library_jobs SET status='paused', updated_at=? "
+            "WHERE status='running'",
+            (now,),
+        )

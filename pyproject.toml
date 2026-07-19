@@ -1,10 +1,11 @@
 [project]
 name = "hi-res-recorder"
-version = "4.3.0"
-description = "Unity-gain recorder with native archive and SoXR VHQ 24/48 DJ exports"
+version = "4.4.0"
+description = "Native-rate recorder and verified SoXR VHQ 24/48 DJ library builder"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "av>=18.0.0",
     "customtkinter>=5.2.2",
     "mutagen>=1.47.0",
     "numpy>=2.4.4",

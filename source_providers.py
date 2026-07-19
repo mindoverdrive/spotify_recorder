@@ -51,6 +51,9 @@ class SpotifySourceAdapter:
         result.setdefault("source_verified", False)
         return result
 
+    def desired_sample_rate(self, _snapshot=None):
+        return 44100
+
     def quality_status(self):
         settings = read_spotify_quality_settings()
         evaluation = evaluate_spotify_quality_settings(settings)
@@ -68,12 +71,23 @@ class SpotifySourceAdapter:
     def format_quality(self, status):
         return format_spotify_quality_settings(status.settings)
 
-    def preflight(self, _device, **_kwargs):
+    def preflight(self, device, **_kwargs):
         settings = read_spotify_quality_settings()
         evaluation = evaluate_spotify_quality_settings(settings)
+        warnings = list(evaluation["warnings"])
+        device_rate = int(round(float(device.get("nominal_sample_rate") or 0)))
+        if device_rate != 44100:
+            warnings.append(
+                f"レート不一致: Spotify 44100Hz / CoreAudio {device_rate}Hz"
+            )
+        if int(device.get("max_input_channels", 0)) < 2:
+            warnings.append("入力デバイスにステレオ入力がありません")
+        name = str(device.get("name", "")).lower()
+        if not any(token in name for token in ("loopback", "blackhole")):
+            warnings.append("単一のLoopback/BlackHole入力を確認できません")
         return {
-            "conditions_pass": evaluation["conditions_pass"],
-            "warnings": list(evaluation["warnings"]),
+            "conditions_pass": not warnings,
+            "warnings": warnings,
             "notes": list(evaluation["notes"]),
             "source_verified": False,
             "source_sample_rate": 44100,
@@ -102,6 +116,16 @@ class QobuzSourceAdapter:
         self.last_snapshot = get_qobuz_snapshot(self.qobuz_dir)
         self.last_snapshot["source_mode"] = QOBUZ_OFFLINE.lower()
         return self.last_snapshot
+
+    def desired_sample_rate(self, snapshot=None):
+        current = snapshot or self.last_snapshot or self.snapshot()
+        if not current.get("source_verified"):
+            return None
+        try:
+            rate = int(current.get("source_sample_rate"))
+        except (TypeError, ValueError):
+            return None
+        return rate if 8000 <= rate <= 384000 else None
 
     def quality_status(self):
         diagnostic = diagnose_qobuz_integration(self.qobuz_dir)

@@ -1,6 +1,8 @@
+import json
 import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -18,8 +20,24 @@ from capture_spool import (
     check_capture_disk_space,
     list_recoverable_sessions,
 )
-from coreaudio_devices import resolve_coreaudio_device
-from recording_catalog import default_catalog_path, list_audio_exports, list_recordings
+from coreaudio_devices import (
+    SampleRateSyncResult,
+    resolve_coreaudio_device,
+    sync_nominal_sample_rate,
+)
+from library_converter import (
+    LibraryConversionQueue,
+    default_library_destination,
+    library_codec_diagnostics,
+    scan_library,
+)
+from recording_catalog import (
+    default_catalog_path,
+    list_audio_exports,
+    list_library_assets,
+    list_library_jobs,
+    list_recordings,
+)
 from spotify_recorder_services import (
     MODE_PRESETS,
     MODE_ALBUM,
@@ -80,8 +98,17 @@ class HiResRecorderApp(ctk.CTk):
         self._stream_start_ch = 1
         self.spotify_quality_settings = {"available": False}
         self.capture_quality_audit = None
+        self.rate_sync_lock = threading.Lock()
+        self.rate_sync_in_progress = False
+        self.pending_record_start = False
+        self.last_rate_sync = None
+        self.device_state_unavailable_reported = False
         self.provider_adapters = create_provider_adapters()
         self.catalog_path = default_catalog_path()
+        self.library_queue = LibraryConversionQueue(
+            self.catalog_path,
+            event_callback=self.on_library_conversion_event,
+        )
 
         self.log_queue = queue.Queue()
         self.ui_queue = queue.Queue()
@@ -98,6 +125,11 @@ class HiResRecorderApp(ctk.CTk):
         self.auto_stop_on_idle = ctk.BooleanVar(value=True)
         self.auto_stop_grace_sec = ctk.DoubleVar(value=3.0)
         self.record_mode = ctk.StringVar(value=MODE_ALBUM)
+        self.library_source_dir = ctk.StringVar(value="")
+        self.library_destination_dir = ctk.StringVar(
+            value=default_library_destination()
+        )
+        self.current_library_job_id = None
 
         self.audio_devices = sd.query_devices()
         self.input_devices = [
@@ -138,9 +170,19 @@ class HiResRecorderApp(ctk.CTk):
             return
         try:
             info = sd.query_devices(self.device_in_id, "input")
-            self.sample_rate = int(info.get("default_samplerate", DEFAULT_SAMPLE_RATE))
+            coreaudio = resolve_coreaudio_device(info["name"], self.audio_devices)
+            self.sample_rate = int(
+                round(coreaudio.nominal_sample_rate)
+                or info.get("default_samplerate", DEFAULT_SAMPLE_RATE)
+            )
         except Exception:
-            self.sample_rate = DEFAULT_SAMPLE_RATE
+            try:
+                info = sd.query_devices(self.device_in_id, "input")
+                self.sample_rate = int(
+                    info.get("default_samplerate", DEFAULT_SAMPLE_RATE)
+                )
+            except Exception:
+                self.sample_rate = DEFAULT_SAMPLE_RATE
 
     def build_ui(self):
         root = ctk.CTkFrame(self, corner_radius=12)
@@ -178,6 +220,13 @@ class HiResRecorderApp(ctk.CTk):
             wraplength=720,
         )
         self.source_quality_label.pack(pady=(0, 8), padx=10)
+        self.rate_sync_label = ctk.CTkLabel(
+            info,
+            text="入力レート: 確認中",
+            text_color="#f0b429",
+            wraplength=720,
+        )
+        self.rate_sync_label.pack(pady=(0, 8), padx=10)
 
         meter_frame = ctk.CTkFrame(root, fg_color="transparent")
         meter_frame.pack(fill="x", padx=18, pady=2)
@@ -552,6 +601,8 @@ class HiResRecorderApp(ctk.CTk):
         self.update_sample_rate()
         self.log_message(f"入力デバイス: {self.device_in_id} / {self.sample_rate}Hz")
         self.refresh_source_quality_status()
+        snapshot = self.current_source_info or {"state": "stopped"}
+        self.consider_idle_sample_rate_sync(snapshot)
 
     def current_adapter(self):
         return self.provider_adapters[self.provider.get()]
@@ -568,6 +619,8 @@ class HiResRecorderApp(ctk.CTk):
             self.log_message(f"Standby監視対象を{value} Offlineへ変更しました。")
         if refresh:
             self.refresh_source_quality_status(log_result=True)
+        snapshot = self.current_source_info or {"state": "stopped"}
+        self.after(0, lambda: self.consider_idle_sample_rate_sync(snapshot))
 
     def current_device_profile(self):
         if self.device_in_id is None:
@@ -578,25 +631,209 @@ class HiResRecorderApp(ctk.CTk):
         profile["max_input_channels"] = int(device_info["max_input_channels"])
         return profile
 
+    def desired_capture_sample_rate(self, snapshot=None):
+        try:
+            return self.current_adapter().desired_sample_rate(snapshot)
+        except Exception:
+            return None
+
+    def _set_rate_sync_status(self, text, color="#f0b429"):
+        if hasattr(self, "rate_sync_label"):
+            self.rate_sync_label.configure(text=f"入力レート: {text}", text_color=color)
+
+    def request_sample_rate_sync(
+        self,
+        snapshot=None,
+        reopen_standby=False,
+        start_recording_after=False,
+    ):
+        if self.is_recording or self.rate_sync_in_progress:
+            return False
+        target = self.desired_capture_sample_rate(snapshot)
+        if not target:
+            self._set_rate_sync_status("ソースレート未検証")
+            return False
+        try:
+            profile = self.current_device_profile()
+        except Exception as exc:
+            self._set_rate_sync_status(f"デバイス確認失敗: {exc}", "#ff5964")
+            return False
+        before = int(round(float(profile.get("nominal_sample_rate") or 0)))
+        if before == int(target):
+            try:
+                result = sync_nominal_sample_rate(profile, int(target))
+            except Exception as exc:
+                result = SampleRateSyncResult(
+                    device_id=int(profile["device_id"]),
+                    device_uid=profile.get("uid"),
+                    device_name=profile["name"],
+                    target_rate=int(target),
+                    rate_before=before,
+                    rate_after=before,
+                    supported=False,
+                    changed=False,
+                    verified=False,
+                    reason=str(exc),
+                )
+            self.last_rate_sync = result.to_dict()
+            if result.verified:
+                self.sample_rate = before
+                self._set_rate_sync_status(
+                    f"同期済み {self.provider.get()} {target}Hz = {profile['name']} {before}Hz",
+                    "#63f08f",
+                )
+                return True
+            self._set_rate_sync_status(f"検証失敗: {result.reason}", "#ff5964")
+            self.log_message(f"CoreAudioレート検証失敗: {result.reason}")
+            return False
+        if source_is_playing(snapshot or {}):
+            self._set_rate_sync_status(
+                f"待機 {self.provider.get()} {target}Hz / CoreAudio {before}Hz",
+                "#ff5964",
+            )
+            self.log_message(
+                f"レート不一致: 再生中は変更しません ({target}Hz / {before}Hz)。"
+                "停止または一時停止後に自動同期し、曲頭から再生してください。"
+            )
+            return False
+        with self.rate_sync_lock:
+            if self.rate_sync_in_progress:
+                return False
+            self.rate_sync_in_progress = True
+        self.pending_record_start = bool(start_recording_after)
+        had_stream = bool(self.stream)
+        if had_stream:
+            self.stop_audio_stream()
+        with self.audio_lock:
+            self.pre_chunks = []
+            self.pre_samples = 0
+        self._set_rate_sync_status(f"同期中 {before}Hz -> {target}Hz", "#58a6ff")
+        self.log_message(
+            f"CoreAudioレート自動同期開始: {profile['name']} {before}Hz -> {target}Hz"
+        )
+
+        def worker():
+            try:
+                result = sync_nominal_sample_rate(profile, int(target))
+                if result.verified:
+                    sd.check_input_settings(
+                        device=self.device_in_id,
+                        channels=2,
+                        dtype="float32",
+                        samplerate=int(target),
+                    )
+            except Exception as exc:
+                result = SampleRateSyncResult(
+                    device_id=int(profile["device_id"]),
+                    device_uid=profile.get("uid"),
+                    device_name=profile["name"],
+                    target_rate=int(target),
+                    rate_before=before,
+                    rate_after=before,
+                    supported=False,
+                    changed=False,
+                    verified=False,
+                    reason=str(exc),
+                )
+
+            def finish():
+                self.last_rate_sync = result.to_dict()
+                self.rate_sync_in_progress = False
+                if result.verified:
+                    self.sample_rate = int(result.rate_after)
+                    self._set_rate_sync_status(
+                        f"同期済み {result.device_name} {result.rate_after}Hz",
+                        "#63f08f",
+                    )
+                    self.log_message(
+                        f"CoreAudioレート自動同期完了: {result.rate_before}Hz -> "
+                        f"{result.rate_after}Hz / {result.reason}"
+                    )
+                else:
+                    self._set_rate_sync_status(
+                        f"同期失敗: {result.reason}", "#ff5964"
+                    )
+                    self.log_message(f"CoreAudioレート自動同期失敗: {result.reason}")
+                should_reopen = (
+                    result.verified
+                    and self.is_standby
+                    and not self.is_recording
+                    and (reopen_standby or had_stream)
+                )
+                if should_reopen:
+                    self.start_audio_stream()
+                pending = self.pending_record_start
+                self.pending_record_start = False
+                if pending and result.verified:
+                    self.start_rec()
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return False
+
+    def ensure_sample_rate_before_recording(self):
+        snapshot = self.current_adapter().snapshot()
+        self.current_source_info = snapshot
+        target = self.desired_capture_sample_rate(snapshot)
+        if not target:
+            return True
+        try:
+            current = int(
+                round(float(self.current_device_profile()["nominal_sample_rate"]))
+            )
+        except Exception as exc:
+            self._set_rate_sync_status(f"デバイス確認失敗: {exc}", "#ff5964")
+            self.log_message(f"録音開始拒否: CoreAudio入力を検証できません: {exc}")
+            return False
+        if current == int(target):
+            return self.request_sample_rate_sync(snapshot)
+        if source_is_playing(snapshot):
+            self.request_sample_rate_sync(snapshot)
+            return False
+        self.request_sample_rate_sync(
+            snapshot,
+            reopen_standby=self.is_standby,
+            start_recording_after=True,
+        )
+        return False
+
+    def consider_idle_sample_rate_sync(self, snapshot):
+        if self.is_recording or self.rate_sync_in_progress or source_is_playing(snapshot):
+            return
+        target = self.desired_capture_sample_rate(snapshot)
+        if not target:
+            return
+        try:
+            current = int(
+                round(float(self.current_device_profile()["nominal_sample_rate"]))
+            )
+        except Exception:
+            return
+        if current != int(target):
+            self.request_sample_rate_sync(
+                snapshot,
+                reopen_standby=self.is_standby,
+            )
+        else:
+            self.request_sample_rate_sync(snapshot)
+
     def source_preflight(self):
         adapter = self.current_adapter()
         try:
             device = self.current_device_profile()
         except Exception as exc:
-            if self.provider.get() == PROVIDER_QOBUZ:
-                return {
-                    "conditions_pass": False,
-                    "warnings": [str(exc)],
-                    "assurance_label": "Qobuz録音経路を検証できません",
-                    "source_sample_rate": None,
-                }
-            device_info = sd.query_devices(self.device_in_id, "input")
-            device = {
-                "name": device_info["name"],
-                "nominal_sample_rate": self.sample_rate,
-                "max_input_channels": int(device_info["max_input_channels"]),
+            return {
+                "conditions_pass": False,
+                "warnings": [str(exc)],
+                "assurance_label": f"{self.provider.get()}録音経路を検証できません",
+                "source_sample_rate": None,
             }
-        return adapter.preflight(device)
+        result = adapter.preflight(device)
+        evidence = result.setdefault("evidence", {})
+        if self.last_rate_sync:
+            evidence["rate_sync"] = dict(self.last_rate_sync)
+        return result
 
     def browse_dir(self):
         folder = filedialog.askdirectory(initialdir=self.save_dir.get())
@@ -640,6 +877,30 @@ class HiResRecorderApp(ctk.CTk):
     def on_standby_toggle(self):
         self.is_standby = self.standby_switch.get() == 1
         if self.is_standby:
+            snapshot = self.current_adapter().snapshot()
+            self.current_source_info = snapshot
+            target = self.desired_capture_sample_rate(snapshot)
+            try:
+                current = int(
+                    round(float(self.current_device_profile()["nominal_sample_rate"]))
+                )
+            except Exception:
+                current = self.sample_rate
+            if target and current != int(target):
+                if source_is_playing(snapshot):
+                    self.request_sample_rate_sync(snapshot, reopen_standby=True)
+                    self.status_label.configure(
+                        text="Rate Sync Waiting", text_color="#f0b429"
+                    )
+                else:
+                    self.request_sample_rate_sync(snapshot, reopen_standby=True)
+                    self.status_label.configure(
+                        text="Syncing Input Rate", text_color="#58a6ff"
+                    )
+                self.log_message(
+                    f"Standbyは入力レート{target}Hzへの同期完了後に開始します。"
+                )
+                return
             if self.start_audio_stream():
                 self.status_label.configure(text="Standby", text_color="#f0b429")
                 self.pre_chunks = []
@@ -767,6 +1028,11 @@ class HiResRecorderApp(ctk.CTk):
     def start_rec(self):
         if self.is_recording:
             return
+        if self.rate_sync_in_progress:
+            self.log_message("入力レート同期中のため録音開始を待機します。")
+            return
+        if not self.ensure_sample_rate_before_recording():
+            return
         self.update_sample_rate()
         try:
             maximum_minutes = int(self.maximum_recording_minutes.get())
@@ -834,6 +1100,7 @@ class HiResRecorderApp(ctk.CTk):
             provider=self.provider.get().lower(),
             source_evaluation=source_evaluation,
         )
+        self.device_state_unavailable_reported = False
         self.log_message(f"録音監査開始: {source_evaluation['assurance_label']}")
 
         self.source_idle_since = None
@@ -1068,6 +1335,8 @@ class HiResRecorderApp(ctk.CTk):
         tabs.pack(fill="both", expand=True, padx=12, pady=12)
         recordings_tab = tabs.add("録音履歴")
         flac_tab = tabs.add("FLAC出力")
+        library_tab = tabs.add("ライブラリ変換")
+        self.build_library_conversion_tab(library_tab)
 
         toolbar = ctk.CTkFrame(recordings_tab, fg_color="transparent")
         toolbar.pack(fill="x", padx=10, pady=(8, 8))
@@ -1485,6 +1754,417 @@ class HiResRecorderApp(ctk.CTk):
         flac_search_entry.bind("<Return>", render_flac)
         render_flac()
 
+    def on_library_conversion_event(self, event, payload):
+        messages = {
+            "started": "ライブラリ変換を開始しました",
+            "paused": "ライブラリ変換を一時停止しました",
+            "resumed": "ライブラリ変換を再開しました",
+            "cancelled": "ライブラリ変換を停止しました。未処理項目は再開できます",
+            "complete": "ライブラリ変換が完了しました",
+            "capacity_error": "ライブラリ変換を開始できません: SSD空き容量不足",
+            "destination_missing": "ライブラリ変換を一時停止しました: 出力SSDが見つかりません",
+        }
+        if event in messages:
+            self.log_message(messages[event])
+        elif event == "asset_failed":
+            self.log_message(
+                f"ライブラリ変換失敗: {os.path.basename(payload.get('source_path', ''))} / "
+                f"{payload.get('reason', '不明なエラー')}"
+            )
+        refresh = getattr(self, "library_ui_refresh", None)
+        if refresh is not None:
+            self.ui_queue.put(refresh)
+
+    def build_library_conversion_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        path_frame = ctk.CTkFrame(parent, fg_color="#161a1f", corner_radius=6)
+        path_frame.pack(fill="x", padx=10, pady=(8, 6))
+        path_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(path_frame, text="入力フォルダ").grid(
+            row=0, column=0, sticky="w", padx=10, pady=(10, 4)
+        )
+        ctk.CTkLabel(
+            path_frame,
+            textvariable=self.library_source_dir,
+            anchor="w",
+            fg_color="#252b33",
+            corner_radius=5,
+        ).grid(row=0, column=1, sticky="ew", padx=8, pady=(10, 4))
+
+        def choose_source():
+            selected = filedialog.askdirectory(
+                initialdir=self.library_source_dir.get() or os.path.expanduser("~/Downloads")
+            )
+            if selected:
+                self.library_source_dir.set(selected)
+
+        ctk.CTkButton(
+            path_frame, text="選択", width=64, command=choose_source
+        ).grid(row=0, column=2, padx=(0, 10), pady=(10, 4))
+        ctk.CTkLabel(path_frame, text="24/48出力").grid(
+            row=1, column=0, sticky="w", padx=10, pady=(4, 10)
+        )
+        ctk.CTkLabel(
+            path_frame,
+            textvariable=self.library_destination_dir,
+            anchor="w",
+            fg_color="#252b33",
+            corner_radius=5,
+        ).grid(row=1, column=1, sticky="ew", padx=8, pady=(4, 10))
+
+        def choose_destination():
+            selected = filedialog.askdirectory(
+                initialdir=self.library_destination_dir.get()
+                if os.path.isdir(self.library_destination_dir.get())
+                else "/Volumes"
+            )
+            if selected:
+                if os.path.basename(selected) == "Go SSD":
+                    selected = os.path.join(selected, "DJ Library 24-48")
+                self.library_destination_dir.set(selected)
+
+        ctk.CTkButton(
+            path_frame, text="選択", width=64, command=choose_destination
+        ).grid(row=1, column=2, padx=(0, 10), pady=(4, 10))
+
+        toolbar = ctk.CTkFrame(parent, fg_color="transparent")
+        toolbar.pack(fill="x", padx=10, pady=4)
+        scan_button = ctk.CTkButton(toolbar, text="事前走査", width=88)
+        scan_button.pack(side="left", padx=(0, 5))
+        start_button = ctk.CTkButton(
+            toolbar,
+            text="変換開始",
+            width=88,
+            fg_color="#1DB954",
+            hover_color="#1ed760",
+            text_color="#06170c",
+            state="disabled",
+        )
+        start_button.pack(side="left", padx=5)
+        pause_button = ctk.CTkButton(
+            toolbar, text="一時停止", width=88, state="disabled"
+        )
+        pause_button.pack(side="left", padx=5)
+        cancel_button = ctk.CTkButton(
+            toolbar,
+            text="停止",
+            width=70,
+            state="disabled",
+            fg_color="#414852",
+        )
+        cancel_button.pack(side="left", padx=5)
+        status_label = ctk.CTkLabel(toolbar, text="未走査", text_color="#aab2bd")
+        status_label.pack(side="right")
+
+        progress = ctk.CTkProgressBar(parent, height=10, progress_color="#1DB954")
+        progress.pack(fill="x", padx=10, pady=(2, 6))
+        progress.set(0)
+        scan_summary_label = ctk.CTkLabel(
+            parent,
+            text="走査情報なし",
+            anchor="w",
+            justify="left",
+            text_color="#808995",
+            wraplength=900,
+        )
+        scan_summary_label.pack(fill="x", padx=12, pady=(0, 6))
+
+        filter_bar = ctk.CTkFrame(parent, fg_color="transparent")
+        filter_bar.pack(fill="x", padx=10, pady=(0, 6))
+        search_var = ctk.StringVar()
+        status_filter = ctk.StringVar(value="すべて")
+        job_var = ctk.StringVar(value="")
+        job_labels = {}
+        job_selector = ctk.CTkOptionMenu(
+            filter_bar,
+            variable=job_var,
+            values=["履歴なし"],
+            width=210,
+        )
+        job_selector.pack(side="left", padx=(0, 8))
+        search_entry = ctk.CTkEntry(
+            filter_bar,
+            textvariable=search_var,
+            placeholder_text="ファイル名・形式・理由",
+        )
+        search_entry.pack(side="left", fill="x", expand=True)
+        ctk.CTkSegmentedButton(
+            filter_bar,
+            values=["すべて", "完了", "重複", "スキップ", "失敗", "待機"],
+            variable=status_filter,
+        ).pack(side="left", padx=(8, 0))
+
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="#11151a")
+        scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        def select_job(label):
+            selected_id = job_labels.get(label)
+            if selected_id:
+                self.current_library_job_id = selected_id
+                render()
+
+        def current_job():
+            jobs = list_library_jobs(limit=200, database_path=self.catalog_path)
+            known_ids = {item["job_id"] for item in jobs}
+            if self.current_library_job_id not in known_ids and jobs:
+                self.current_library_job_id = jobs[0]["job_id"]
+            return self.current_library_job_id
+
+        def format_counts(values, suffix=""):
+            return ", ".join(
+                f"{key}{suffix} x{count}"
+                for key, count in sorted(
+                    (values or {}).items(), key=lambda item: str(item[0])
+                )
+            ) or "なし"
+
+        def render():
+            if not scroll.winfo_exists():
+                return
+            for child in scroll.winfo_children():
+                child.destroy()
+            job_id = current_job()
+            if not job_id:
+                ctk.CTkLabel(
+                    scroll,
+                    text="入力フォルダを選択して事前走査を実行してください",
+                    text_color="#808995",
+                ).pack(pady=28)
+                return
+            jobs = list_library_jobs(limit=200, database_path=self.catalog_path)
+            job_labels.clear()
+            selected_label = None
+            labels = []
+            for candidate in jobs:
+                label = (
+                    f"{candidate['created_at'][:16]} | "
+                    f"{os.path.basename(candidate['source_root']) or candidate['source_root']} | "
+                    f"{candidate['status']}"
+                )
+                if label in job_labels:
+                    label = f"{label} | {candidate['job_id'][:8]}"
+                labels.append(label)
+                job_labels[label] = candidate["job_id"]
+                if candidate["job_id"] == job_id:
+                    selected_label = label
+            job_selector.configure(values=labels or ["履歴なし"])
+            if selected_label and job_var.get() != selected_label:
+                job_var.set(selected_label)
+            job = next((item for item in jobs if item["job_id"] == job_id), None)
+            if job:
+                total = max(1, int(job["total_files"]))
+                finished = sum(
+                    int(job[key])
+                    for key in (
+                        "completed_files",
+                        "duplicate_files",
+                        "skipped_files",
+                        "failed_files",
+                    )
+                )
+                progress.set(min(1.0, finished / total))
+                status_label.configure(
+                    text=(
+                        f"{job['status']} / 完了 {job['completed_files']} / "
+                        f"重複 {job['duplicate_files']} / スキップ {job['skipped_files']} / "
+                        f"失敗 {job['failed_files']} / 全{job['total_files']}"
+                    )
+                )
+                start_button.configure(
+                    state="disabled" if self.library_queue.running else "normal",
+                    text=(
+                        "失敗分を再試行"
+                        if int(job["failed_files"]) > 0
+                        else "変換開始"
+                    ),
+                )
+                pause_button.configure(
+                    state="normal" if self.library_queue.running else "disabled",
+                    text="再開" if self.library_queue.paused else "一時停止",
+                )
+                cancel_button.configure(
+                    state="normal" if self.library_queue.running else "disabled"
+                )
+                summary = (job.get("settings") or {}).get("scan_summary") or {}
+                duration = float(summary.get("duration_sec") or 0.0)
+                scan_summary_label.configure(
+                    text=(
+                        f"再生時間 {duration / 3600:.2f}時間 / "
+                        f"予測上限 {int(job['projected_bytes']) / 1024**3:.2f}GiB\n"
+                        f"形式: {format_counts(summary.get('formats'))} / "
+                        f"レート: {format_counts(summary.get('sample_rates'), 'Hz')} / "
+                        f"深度: {format_counts(summary.get('bit_depths'), '-bit')}"
+                    )
+                )
+            mapping = {
+                "完了": {"complete"},
+                "重複": {"duplicate"},
+                "スキップ": {"skipped"},
+                "失敗": {"failed"},
+                "待機": {"queued", "converting"},
+            }
+            selected = mapping.get(status_filter.get())
+            assets = list_library_assets(
+                job_id,
+                statuses=selected,
+                limit=5000,
+                database_path=self.catalog_path,
+            )
+            query = search_var.get().strip().casefold()
+            if query:
+                assets = [
+                    item
+                    for item in assets
+                    if query
+                    in " ".join(
+                        str(item.get(key) or "")
+                        for key in (
+                            "relative_path",
+                            "source_codec",
+                            "reason",
+                            "status",
+                        )
+                    ).casefold()
+                ]
+            if not assets:
+                ctk.CTkLabel(
+                    scroll, text="該当項目はありません", text_color="#808995"
+                ).pack(pady=24)
+                return
+            colors = {
+                "complete": "#63f08f",
+                "duplicate": "#58a6ff",
+                "skipped": "#f0b429",
+                "failed": "#ff5964",
+                "converting": "#58a6ff",
+                "queued": "#aab2bd",
+            }
+            for item in assets[:1000]:
+                row = ctk.CTkFrame(scroll, corner_radius=6)
+                row.pack(fill="x", padx=4, pady=3)
+                row.grid_columnconfigure(0, weight=1)
+                ctk.CTkLabel(
+                    row,
+                    text=item["relative_path"],
+                    anchor="w",
+                    font=ctk.CTkFont(size=13, weight="bold"),
+                ).grid(row=0, column=0, sticky="ew", padx=10, pady=(7, 1))
+                ctk.CTkLabel(
+                    row,
+                    text=item["status"],
+                    text_color=colors.get(item["status"], "#aab2bd"),
+                ).grid(row=0, column=1, sticky="e", padx=10, pady=(7, 1))
+                details = (
+                    f"{item.get('source_codec') or '?'} / "
+                    f"{item.get('source_bit_depth') or '?'}-bit / "
+                    f"{item.get('source_sample_rate') or '?'}Hz / "
+                    f"{item.get('source_channels') or '?'}ch / "
+                    f"Dither {item.get('dither') or '-'} / "
+                    f"SRC {item.get('src_engine') or '-'}"
+                )
+                ctk.CTkLabel(
+                    row, text=details, anchor="w", text_color="#aab2bd"
+                ).grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 2))
+                if item.get("reason"):
+                    ctk.CTkLabel(
+                        row,
+                        text=item["reason"],
+                        anchor="w",
+                        text_color="#ff9b9b",
+                        wraplength=720,
+                    ).grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 7))
+                if item.get("output_exists"):
+                    ctk.CTkButton(
+                        row,
+                        text="Finder",
+                        width=62,
+                        height=25,
+                        command=lambda path=item["output_path"]: subprocess.run(
+                            ["open", "-R", path], check=False
+                        ),
+                    ).grid(row=1, column=1, rowspan=2, padx=8, pady=5)
+
+        self.library_ui_refresh = render
+
+        def scan_action():
+            if self.library_queue.running:
+                return
+            source = self.library_source_dir.get()
+            destination = self.library_destination_dir.get()
+            scan_button.configure(state="disabled")
+            status_label.configure(text="走査中...")
+
+            def worker():
+                try:
+                    summary = scan_library(
+                        source,
+                        destination,
+                        database_path=self.catalog_path,
+                    )
+
+                    def finish():
+                        self.current_library_job_id = summary["job_id"]
+                        projected = summary["projected_bytes"] / 1024**3
+                        status_label.configure(
+                            text=(
+                                f"走査完了: 対象 {summary['queued_files']} / "
+                                f"スキップ {summary['skipped_files']} / "
+                                f"最大見積 {projected:.1f} GiB"
+                            )
+                        )
+                        scan_summary_label.configure(
+                            text=(
+                                f"再生時間 {summary['duration_sec'] / 3600:.2f}時間 / "
+                                f"予測上限 {projected:.2f}GiB\n"
+                                f"形式: {format_counts(summary['formats'])} / "
+                                f"レート: {format_counts(summary['sample_rates'], 'Hz')} / "
+                                f"深度: {format_counts(summary['bit_depths'], '-bit')}"
+                            )
+                        )
+                        scan_button.configure(state="normal")
+                        start_button.configure(state="normal")
+                        render()
+
+                    self.after(0, finish)
+                except Exception as exc:
+                    error = str(exc)
+                    self.log_message(f"ライブラリ走査失敗: {error}")
+                    self.after(
+                        0,
+                        lambda error=error: (
+                            status_label.configure(text=f"走査失敗: {error}"),
+                            scan_button.configure(state="normal"),
+                        ),
+                    )
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def start_action():
+            job_id = current_job()
+            if not job_id or self.library_queue.running:
+                return
+            self.library_queue.start(job_id)
+            render()
+
+        def pause_action():
+            if not self.library_queue.running:
+                return
+            if self.library_queue.paused:
+                self.library_queue.resume()
+            else:
+                self.library_queue.pause()
+            render()
+
+        scan_button.configure(command=scan_action)
+        start_button.configure(command=start_action)
+        pause_button.configure(command=pause_action)
+        cancel_button.configure(command=self.library_queue.cancel)
+        job_selector.configure(command=select_job)
+        status_filter.trace_add("write", lambda *_args: render())
+        search_entry.bind("<Return>", lambda _event: render())
+        render()
+
     def on_processing_finished(self):
         if self.pending_spool_audio is not None:
             self.pending_spool_audio.close(delete=True)
@@ -1513,6 +2193,34 @@ class HiResRecorderApp(ctk.CTk):
         adapter = self.current_adapter()
         info = adapter.snapshot()
         self.current_source_info = info
+
+        if self.is_recording and self.capture_quality_audit is not None:
+            try:
+                observed_device_rate = int(
+                    round(float(self.current_device_profile()["nominal_sample_rate"]))
+                )
+            except Exception as exc:
+                if not self.device_state_unavailable_reported:
+                    self.capture_quality_audit.add_external_event(
+                        "device_state_unavailable",
+                        f"録音中のCoreAudio状態を確認できません: {exc}",
+                    )
+                    self.device_state_unavailable_reported = True
+            else:
+                self.device_state_unavailable_reported = False
+                if observed_device_rate != int(self.sample_rate):
+                    detail = (
+                        f"録音中にCoreAudio入力レートが変更されました: "
+                        f"{self.sample_rate}Hz -> {observed_device_rate}Hz。"
+                        "異なるレートを同一セッションへ混在させないため停止します"
+                    )
+                    self.capture_quality_audit.add_external_event(
+                        "device_sample_rate_change", detail
+                    )
+                    self.log_message(f"品質重大エラー: {detail}")
+                    self.stop_rec()
+                    self.after(CHECK_INTERVAL_MS, self.poll_source)
+                    return
 
         if self.is_recording and self.capture_quality_audit is not None:
             for event in adapter.poll_events():
@@ -1594,6 +2302,9 @@ class HiResRecorderApp(ctk.CTk):
                     self.add_history_track(info, estimated_start)
                     self.log_message(f"曲変更: {info['artist']} - {info['name']}")
 
+            if not self.is_recording and not source_is_playing(info):
+                self.consider_idle_sample_rate_sync(info)
+
         elif info.get("status") in ("IDLE", "CLOSED", "UNAVAILABLE"):
             if self.is_recording and self.capture_quality_audit is not None:
                 self.capture_quality_audit.observe_playback(None, "idle", None)
@@ -1612,9 +2323,13 @@ class HiResRecorderApp(ctk.CTk):
                     self.log_message(f"{adapter.name}終了検知、録音停止")
                     self.stop_rec()
 
+            if not self.is_recording:
+                self.consider_idle_sample_rate_sync(info)
+
         self.after(CHECK_INTERVAL_MS, self.poll_source)
 
     def on_closing(self):
+        self.library_queue.cancel()
         self.stop_audio_stream()
         if self.capture_spool is not None:
             self.capture_spool.discard()
@@ -1624,8 +2339,13 @@ class HiResRecorderApp(ctk.CTk):
 
 
 if __name__ == "__main__":
-    app = HiResRecorderApp()
-    app.mainloop()
+    if "--self-test-library-codecs" in sys.argv:
+        diagnostics = library_codec_diagnostics()
+        print(json.dumps(diagnostics, ensure_ascii=False, sort_keys=True))
+        raise SystemExit(0 if diagnostics["ok"] else 1)
+    else:
+        app = HiResRecorderApp()
+        app.mainloop()
 
 
 SpotifyRecorderApp = HiResRecorderApp

@@ -1,5 +1,6 @@
 import ctypes
 import ctypes.util
+import time
 from dataclasses import asdict, dataclass
 
 
@@ -15,6 +16,13 @@ class AudioObjectPropertyAddress(ctypes.Structure):
     ]
 
 
+class AudioValueRange(ctypes.Structure):
+    _fields_ = [
+        ("minimum", ctypes.c_double),
+        ("maximum", ctypes.c_double),
+    ]
+
+
 SYSTEM_OBJECT = 1
 GLOBAL_SCOPE = _fourcc("glob")
 INPUT_SCOPE = _fourcc("inpt")
@@ -23,6 +31,7 @@ PROPERTY_DEVICES = _fourcc("dev#")
 PROPERTY_NAME = _fourcc("lnam")
 PROPERTY_UID = _fourcc("uid ")
 PROPERTY_NOMINAL_RATE = _fourcc("nsrt")
+PROPERTY_AVAILABLE_NOMINAL_RATES = _fourcc("nsr#")
 PROPERTY_TRANSPORT = _fourcc("tran")
 TRANSPORT_AGGREGATE = _fourcc("grup")
 
@@ -36,6 +45,23 @@ class CoreAudioDevice:
     transport: str
     max_input_channels: int
     is_aggregate: bool
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class SampleRateSyncResult:
+    device_id: int
+    device_uid: str | None
+    device_name: str
+    target_rate: int
+    rate_before: int
+    rate_after: int
+    supported: bool
+    changed: bool
+    verified: bool
+    reason: str
 
     def to_dict(self):
         return asdict(self)
@@ -65,6 +91,21 @@ def _libraries():
         ctypes.c_void_p,
     ]
     coreaudio.AudioObjectGetPropertyData.restype = ctypes.c_int32
+    coreaudio.AudioObjectIsPropertySettable.argtypes = [
+        ctypes.c_uint32,
+        ctypes.POINTER(AudioObjectPropertyAddress),
+        ctypes.POINTER(ctypes.c_bool),
+    ]
+    coreaudio.AudioObjectIsPropertySettable.restype = ctypes.c_int32
+    coreaudio.AudioObjectSetPropertyData.argtypes = [
+        ctypes.c_uint32,
+        ctypes.POINTER(AudioObjectPropertyAddress),
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    coreaudio.AudioObjectSetPropertyData.restype = ctypes.c_int32
     corefoundation.CFStringGetCString.argtypes = [
         ctypes.c_void_p,
         ctypes.c_char_p,
@@ -179,3 +220,148 @@ def resolve_coreaudio_device(device_name, sounddevice_devices=None):
         reason = "見つかりません" if not matches else "同名デバイスが複数あります"
         raise RuntimeError(f"CoreAudioデバイスを一意に特定できません: {name} ({reason})")
     return matches[0]
+
+
+def available_nominal_sample_rates(device_id):
+    coreaudio, _ = _libraries()
+    raw = _property_bytes(
+        coreaudio,
+        int(device_id),
+        PROPERTY_AVAILABLE_NOMINAL_RATES,
+    )
+    if not raw:
+        return ()
+    item_size = ctypes.sizeof(AudioValueRange)
+    count = len(raw) // item_size
+    if count <= 0:
+        return ()
+    values = (AudioValueRange * count).from_buffer_copy(raw[: count * item_size])
+    return tuple((float(item.minimum), float(item.maximum)) for item in values)
+
+
+def sample_rate_is_supported(target_rate, ranges):
+    target = float(target_rate)
+    return any(float(minimum) <= target <= float(maximum) for minimum, maximum in ranges)
+
+
+def _sync_failure(device, target_rate, before, reason, supported=False):
+    return SampleRateSyncResult(
+        device_id=int(device.device_id),
+        device_uid=device.uid,
+        device_name=device.name,
+        target_rate=int(target_rate),
+        rate_before=int(round(before)),
+        rate_after=int(round(before)),
+        supported=bool(supported),
+        changed=False,
+        verified=False,
+        reason=str(reason),
+    )
+
+
+def sync_nominal_sample_rate(device, target_rate, timeout=2.0, poll_interval=0.05):
+    """Set a dedicated virtual device to a verified nominal sample rate."""
+    if not isinstance(device, CoreAudioDevice):
+        device = CoreAudioDevice(**device)
+    target = int(target_rate)
+    before = float(device.nominal_sample_rate or 0.0)
+    normalized_name = device.name.lower().replace(" ", "")
+    if device.is_aggregate:
+        return _sync_failure(device, target, before, "Aggregate/Multi-Output Deviceは変更できません")
+    if not any(token in normalized_name for token in ("loopback", "blackhole")):
+        return _sync_failure(device, target, before, "専用Loopback/BlackHole以外は変更しません")
+    if not device.uid:
+        return _sync_failure(device, target, before, "CoreAudio Device UIDを取得できません")
+    if int(device.max_input_channels) < 2:
+        return _sync_failure(device, target, before, "ステレオ入力を確認できません")
+    ranges = available_nominal_sample_rates(device.device_id)
+    if not ranges:
+        return _sync_failure(device, target, before, "対応サンプルレートを取得できません")
+    if not sample_rate_is_supported(target, ranges):
+        return _sync_failure(
+            device,
+            target,
+            before,
+            f"デバイスが{target}Hzに対応していません",
+        )
+    if int(round(before)) == target:
+        return SampleRateSyncResult(
+            int(device.device_id),
+            device.uid,
+            device.name,
+            target,
+            target,
+            target,
+            True,
+            False,
+            True,
+            "すでに同期済みです",
+        )
+
+    coreaudio, _ = _libraries()
+    address = _address(PROPERTY_NOMINAL_RATE)
+    settable = ctypes.c_bool(False)
+    status = coreaudio.AudioObjectIsPropertySettable(
+        int(device.device_id), ctypes.byref(address), ctypes.byref(settable)
+    )
+    if status != 0 or not settable.value:
+        return _sync_failure(
+            device,
+            target,
+            before,
+            "nominal sample rateが変更可能ではありません",
+            supported=True,
+        )
+    value = ctypes.c_double(float(target))
+    status = coreaudio.AudioObjectSetPropertyData(
+        int(device.device_id),
+        ctypes.byref(address),
+        0,
+        None,
+        ctypes.sizeof(value),
+        ctypes.byref(value),
+    )
+    if status != 0:
+        return _sync_failure(
+            device,
+            target,
+            before,
+            f"CoreAudioレート変更に失敗しました: OSStatus {status}",
+            supported=True,
+        )
+
+    deadline = time.monotonic() + max(0.05, float(timeout))
+    observed = before
+    while time.monotonic() <= deadline:
+        observed = _property_scalar(
+            coreaudio,
+            int(device.device_id),
+            PROPERTY_NOMINAL_RATE,
+            ctypes.c_double,
+        )
+        if observed is not None and int(round(observed)) == target:
+            return SampleRateSyncResult(
+                int(device.device_id),
+                device.uid,
+                device.name,
+                target,
+                int(round(before)),
+                target,
+                True,
+                True,
+                True,
+                "CoreAudioと目標レートの一致を確認しました",
+            )
+        time.sleep(max(0.005, float(poll_interval)))
+    return SampleRateSyncResult(
+        int(device.device_id),
+        device.uid,
+        device.name,
+        target,
+        int(round(before)),
+        int(round(observed or before)),
+        True,
+        True,
+        False,
+        f"{target}Hzへの変更を確認できませんでした",
+    )

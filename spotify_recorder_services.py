@@ -626,9 +626,39 @@ def _tag_flac(
     audio["TITLE"] = title
     audio["ARTIST"] = artist
     audio["ALBUM"] = album
-    audio["SOURCE_FORMAT"] = "WAV/RF64 IEEE float capture"
-    audio["CAPTURE_GAIN"] = "1.0 (Unity Gain)"
-    audio["EXPORT_ROLE"] = str(process.get("export_role") or "archive")
+    for field in (
+        "albumartist",
+        "date",
+        "genre",
+        "tracknumber",
+        "discnumber",
+        "comment",
+        "isrc",
+        "bpm",
+        "initialkey",
+        "composer",
+        "label",
+    ):
+        value = track_info.get(field)
+        if value not in (None, ""):
+            audio[field.upper()] = str(value)
+    audio["SOURCE_FORMAT"] = str(
+        process.get("source_format") or "WAV/RF64 IEEE float capture"
+    )
+    if process.get("source_format"):
+        audio["SOURCE_CODEC"] = str(process["source_format"])
+    if process.get("source_lossless") is not None:
+        audio["SOURCE_LOSSLESS"] = "YES" if process["source_lossless"] else "NO"
+    if process.get("source_sha256"):
+        audio["SOURCE_SHA256"] = str(process["source_sha256"])
+    if process.get("pcm_sha256"):
+        audio["SOURCE_PCM_SHA256"] = str(process["pcm_sha256"])
+    export_role = str(process.get("export_role") or "archive")
+    if export_role == "library":
+        audio["PROCESSING_GAIN_DB"] = f'{float(process.get("safety_gain_db") or 0.0):.6f}'
+    else:
+        audio["CAPTURE_GAIN"] = "1.0 (Unity Gain)"
+    audio["EXPORT_ROLE"] = export_role
     audio["DITHER"] = str(process.get("dither") or DITHER_NONE)
     audio["DITHER_REASON"] = str(process.get("dither_reason") or "No dither required")
     audio["QUANTIZER"] = str(process.get("quantizer") or QUANTIZER)
@@ -667,9 +697,9 @@ def _tag_flac(
             capture_audit.get("assurance_label") or "Unknown"
         )
         audio["LOSSLESS_VERIFIED"] = "No - source bits were not available for comparison"
-    if process.get("export_role") == "dj":
+    if process.get("export_role") in {"dj", "library"}:
         audio["DERIVATION_NOTICE"] = (
-            "Lossless codec; DSP-derived DJ copy; source bit identity not proven"
+            "Lossless codec; DJ compatibility copy; source bit identity not implied"
         )
     audio.clear_pictures()
     if artwork_bytes:
@@ -760,7 +790,7 @@ def write_pcm24_flac(
     cover = artwork_bytes
     if cover is None and metadata.get("artwork_bytes"):
         cover = metadata["artwork_bytes"]
-    temporary_path = f"{output_path}.part"
+    temporary_path = f"{output_path}.partial"
     rng = np.random.default_rng(random_seed)
     gain = float(10.0 ** (float(gain_db) / 20.0))
     process = dict(processing or {})
@@ -804,6 +834,8 @@ def write_pcm24_flac(
             reference_gain=gain,
             export_role=str(process.get("export_role") or "archive"),
         )
+        with open(temporary_path, "rb") as completed_file:
+            os.fsync(completed_file.fileno())
         os.replace(temporary_path, output_path)
         final_info = sf.info(output_path)
         if final_info.format != "FLAC" or final_info.subtype != FLAC_SUBTYPE:

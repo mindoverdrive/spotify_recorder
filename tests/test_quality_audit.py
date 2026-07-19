@@ -86,10 +86,29 @@ class SpotifySettingsAuditTests(unittest.TestCase):
 
     @patch("source_providers.read_spotify_quality_settings", return_value=GOOD_SETTINGS)
     def test_spotify_adapter_is_offline_only(self, _settings):
-        result = SpotifySourceAdapter().preflight({})
+        result = SpotifySourceAdapter().preflight(
+            {
+                "name": "BlackHole 2ch",
+                "nominal_sample_rate": 44100,
+                "max_input_channels": 2,
+            }
+        )
 
         self.assertTrue(result["conditions_pass"])
         self.assertEqual(result["mode"], "offline")
+
+    @patch("source_providers.read_spotify_quality_settings", return_value=GOOD_SETTINGS)
+    def test_spotify_adapter_rejects_non_native_capture_rate(self, _settings):
+        result = SpotifySourceAdapter().preflight(
+            {
+                "name": "BlackHole 2ch",
+                "nominal_sample_rate": 48000,
+                "max_input_channels": 2,
+            }
+        )
+
+        self.assertFalse(result["conditions_pass"])
+        self.assertTrue(any("レート不一致" in item for item in result["warnings"]))
 
 
 class SpotifyOfflineModeTests(unittest.TestCase):
