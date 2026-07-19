@@ -41,7 +41,7 @@ class CaptureSpoolTests(unittest.TestCase):
         self.assertTrue(spool.overflowed)
         self.assertIn("オーバーフロー", spool.error)
 
-    def test_disk_preflight_accounts_for_spool_and_final_wav(self):
+    def test_disk_preflight_accounts_for_spool_wav_src_temp_and_two_flacs(self):
         with tempfile.TemporaryDirectory() as directory:
             result = check_capture_disk_space(
                 directory,
@@ -52,7 +52,7 @@ class CaptureSpoolTests(unittest.TestCase):
             )
         self.assertTrue(result["ok"])
         self.assertTrue(result["same_volume"])
-        self.assertEqual(result["required_bytes"], 192000 * 60 * 2 * 4 * 3)
+        self.assertEqual(result["required_bytes"], 192000 * 60 * 2 * 4 * 6)
 
 
 class ChunkedAudioTests(unittest.TestCase):

@@ -3,9 +3,11 @@ import tempfile
 import unittest
 
 from recording_catalog import (
+    list_audio_exports,
     list_flac_exports,
     list_recordings,
     migrate_legacy_catalog,
+    record_audio_export,
     record_flac_export,
     record_saved_recording,
     replace_recording_file,
@@ -13,6 +15,65 @@ from recording_catalog import (
 
 
 class RecordingCatalogTests(unittest.TestCase):
+    def test_tracks_archive_and_dj_exports_for_one_recording(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = os.path.join(directory, "recordings.sqlite3")
+            wav_path = os.path.join(directory, "Track.wav")
+            archive_path = os.path.join(directory, "Track.flac")
+            dj_path = os.path.join(directory, "DJ 24-48", "Track.flac")
+            os.makedirs(os.path.dirname(dj_path))
+            for path in (wav_path, archive_path, dj_path):
+                with open(path, "wb") as handle:
+                    handle.write(b"fixture")
+            analysis = {
+                "duration_sec": 1.0,
+                "sample_rate": 96000,
+                "channels": 2,
+                "warnings": [],
+                "full_scale_ranges": [],
+            }
+            record_saved_recording(
+                wav_path,
+                {"name": "Track", "artist": "Artist", "album": "Album"},
+                analysis,
+                database_path=database_path,
+            )
+            record_audio_export(
+                wav_path,
+                archive_path,
+                "complete_wav_retained",
+                export_role="archive",
+                source_sample_rate=96000,
+                source_bit_depth=24,
+                source_verified=True,
+                output_sample_rate=96000,
+                dither="NONE",
+                database_path=database_path,
+            )
+            record_audio_export(
+                wav_path,
+                dj_path,
+                "complete_wav_retained",
+                export_role="dj",
+                source_sample_rate=96000,
+                source_bit_depth=24,
+                source_verified=True,
+                output_sample_rate=48000,
+                src_engine="libsoxr",
+                src_quality="SOXR_VHQ",
+                src_phase="LINEAR",
+                dither="TPDF",
+                database_path=database_path,
+            )
+            exports = list_audio_exports(database_path=database_path)
+
+        self.assertEqual({item["export_role"] for item in exports}, {"archive", "dj"})
+        dj = next(item for item in exports if item["export_role"] == "dj")
+        self.assertEqual(dj["output_sample_rate"], 48000)
+        self.assertEqual(dj["src_quality"], "SOXR_VHQ")
+        self.assertEqual(dj["src_phase"], "LINEAR")
+        self.assertEqual(dj["dither"], "TPDF")
+
     def test_records_and_searches_saved_audio(self):
         with tempfile.TemporaryDirectory() as directory:
             database_path = os.path.join(directory, "recordings.sqlite3")
@@ -144,6 +205,54 @@ class RecordingCatalogTests(unittest.TestCase):
         self.assertEqual(value, "preserved")
         self.assertTrue(source_exists)
 
+    def test_v3_flac_export_rows_migrate_to_archive_role(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = os.path.join(directory, "recordings.sqlite3")
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE flac_exports (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        recording_id INTEGER,
+                        source_wav_path TEXT NOT NULL UNIQUE,
+                        flac_path TEXT,
+                        status TEXT NOT NULL,
+                        reason TEXT NOT NULL DEFAULT '',
+                        bit_depth INTEGER NOT NULL DEFAULT 24,
+                        dither TEXT NOT NULL DEFAULT 'TPDF',
+                        sample_peak_dbfs REAL,
+                        artwork_embedded INTEGER,
+                        source_bytes INTEGER,
+                        flac_bytes INTEGER,
+                        wav_deleted INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO flac_exports (
+                        source_wav_path, flac_path, status, bit_depth, dither,
+                        wav_deleted, created_at, updated_at
+                    ) VALUES (?, ?, 'complete', 24, 'TPDF', 1, ?, ?)
+                    """,
+                    (
+                        os.path.join(directory, "old.wav"),
+                        os.path.join(directory, "old.flac"),
+                        "2026-01-01T00:00:00+00:00",
+                        "2026-01-01T00:00:00+00:00",
+                    ),
+                )
+            exports = list_audio_exports(database_path=database_path)
+
+        self.assertEqual(len(exports), 1)
+        self.assertEqual(exports[0]["export_role"], "archive")
+        self.assertEqual(exports[0]["dither"], "TPDF")
+        self.assertEqual(exports[0]["quantizer"], "LEGACY_TPDF_QUANTIZER")
+
     def test_tracks_flac_export_and_replaces_history_media_path(self):
         with tempfile.TemporaryDirectory() as directory:
             database_path = os.path.join(directory, "recordings.sqlite3")
@@ -191,3 +300,4 @@ class RecordingCatalogTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+    record_audio_export,

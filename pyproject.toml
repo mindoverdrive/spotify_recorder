@@ -1,7 +1,7 @@
 [project]
 name = "hi-res-recorder"
-version = "4.2.1"
-description = "Unity-gain recorder with verified TPDF 24-bit FLAC export"
+version = "4.3.0"
+description = "Unity-gain recorder with native archive and SoXR VHQ 24/48 DJ exports"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -13,4 +13,5 @@ dependencies = [
     "scipy>=1.18.0",
     "sounddevice>=0.5.5",
     "soundfile>=0.14.0",
+    "soxr>=1.1.0",
 ]

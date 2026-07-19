@@ -60,7 +60,7 @@ class FlacExportTests(unittest.TestCase):
         self.assertEqual(tags["title"], ["Track"])
         self.assertEqual(
             tags["dither"],
-            ["TPDF +/-1 LSB peak before 24-bit quantization"],
+            ["TPDF"],
         )
         self.assertEqual(tags.pictures[0].data, PNG_1X1)
         self.assertTrue(result["artwork_embedded"])
@@ -141,11 +141,14 @@ class FlacExportTests(unittest.TestCase):
             exports = list_flac_exports(database_path=database_path)
             recordings = list_recordings(database_path=database_path)
 
-            self.assertEqual(result["status"], "rejected")
+            self.assertEqual(result["status"], "partial")
             self.assertTrue(os.path.isfile(wav_path))
             self.assertFalse(any(name.endswith(".flac") for name in os.listdir(directory)))
-            self.assertEqual(exports[0]["status"], "rejected")
-            self.assertIn("0 dBFS", exports[0]["reason"])
+            archive = next(item for item in exports if item["export_role"] == "archive")
+            dj = next(item for item in exports if item["export_role"] == "dj")
+            self.assertEqual(archive["status"], "rejected")
+            self.assertIn("PCM24", archive["reason"])
+            self.assertEqual(dj["status"], "complete_wav_retained")
             self.assertEqual(recordings[0]["file_path"], wav_path)
 
     def test_catalog_finalization_failure_keeps_verified_wav(self):

@@ -3,6 +3,7 @@
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 audio_binaries = collect_dynamic_libs("_soundfile_data")
+soxr_binaries = collect_dynamic_libs("soxr")
 customtkinter_data = collect_data_files("customtkinter")
 hidden_imports = (
     [
@@ -10,6 +11,7 @@ hidden_imports = (
         "mutagen.flac",
         "pyloudnorm",
         "scipy.signal",
+        "soxr",
         "qobuz_integration",
         "source_providers",
         "capture_spool",
@@ -17,12 +19,13 @@ hidden_imports = (
         "recording_catalog",
     ]
     + collect_submodules("pyloudnorm")
+    + collect_submodules("soxr")
 )
 
 a = Analysis(
     ["spotify_recorder.py"],
     pathex=[],
-    binaries=audio_binaries,
+    binaries=audio_binaries + soxr_binaries,
     datas=customtkinter_data,
     hiddenimports=hidden_imports,
     hookspath=[],
@@ -62,7 +65,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="Hi-Res Recorder.app",
-    version="4.2.1",
+    version="4.3.0",
     bundle_identifier="local.hires-recorder.native",
     info_plist={
         "CFBundleDisplayName": "Hi-Res Recorder",

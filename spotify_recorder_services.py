@@ -1,10 +1,12 @@
 import os
 import subprocess
+import tempfile
 import urllib.request
 from datetime import datetime
 
 import numpy as np
 import pyloudnorm as pyln
+import soxr
 import soundfile as sf
 from scipy.signal import lfilter, resample_poly
 
@@ -13,7 +15,8 @@ from mutagen.id3 import APIC, TALB, TIT2, TPE1, TXXX
 from mutagen.wave import WAVE
 
 from recording_catalog import (
-    record_flac_export,
+    list_audio_exports_for_source,
+    record_audio_export,
     record_saved_recording,
     replace_recording_file,
 )
@@ -39,7 +42,13 @@ TRUE_PEAK_OVERLAP_FRAMES = 256
 RF64_DATA_THRESHOLD = 3_900_000_000
 FLAC_BIT_DEPTH = 24
 FLAC_SUBTYPE = "PCM_24"
-FLAC_DITHER = "TPDF"
+DITHER_NONE = "NONE"
+DITHER_TPDF = "TPDF"
+QUANTIZER = "ROUND_TO_NEAREST_EVEN"
+DJ_SAMPLE_RATE = 48000
+SRC_ENGINE = "libsoxr"
+SRC_QUALITY = "SOXR_VHQ"
+SRC_PHASE = "LINEAR"
 PCM24_SCALE = 1 << 23
 PCM24_MIN = -(1 << 23)
 PCM24_MAX = (1 << 23) - 1
@@ -106,7 +115,7 @@ def build_diagnostic_lines(sample_rate=None):
         
     lines.append("✅ Capture Gain: Unity Gain (1.0 / DSPなし)")
     lines.append(
-        "✅ Output: WAV 32-bit float capture → verified FLAC 24-bit / TPDF / WAV自動削除"
+        "✅ Output: Archive native-rate + DJ 24-bit/48kHz / SoXR VHQ Linear / conditional dither"
     )
     settings = read_spotify_quality_settings()
     settings_evaluation = evaluate_spotify_quality_settings(settings)
@@ -433,15 +442,24 @@ def _image_mime(artwork_bytes):
     return "image/jpeg"
 
 
-def _tpdf_pcm24(samples, rng):
-    source = np.asarray(samples, dtype=np.float64)
+def _quantize_pcm24(samples, dither, rng, gain=1.0):
+    source = np.asarray(samples, dtype=np.float64) * float(gain)
     if not np.isfinite(source).all():
         raise ValueError("音声データにNaNまたはInfが含まれています")
-    if source.size and float(np.max(np.abs(source))) > 1.0:
-        raise FlacExportRejected("Sample Peakが0 dBFSを超えるためFLAC変換を拒否しました")
-    dither = rng.random(source.shape) - rng.random(source.shape)
-    quantized = np.floor(source * PCM24_SCALE + dither + 0.5)
-    quantized = np.clip(quantized, PCM24_MIN, PCM24_MAX).astype(np.int32)
+    scaled = source * PCM24_SCALE
+    if dither == DITHER_TPDF:
+        scaled = scaled + rng.random(source.shape) - rng.random(source.shape)
+    elif dither != DITHER_NONE:
+        raise ValueError(f"未対応のディザ方式です: {dither}")
+    quantized = np.rint(scaled)
+    if quantized.size and (
+        float(np.min(quantized)) < PCM24_MIN
+        or float(np.max(quantized)) > PCM24_MAX
+    ):
+        raise FlacExportRejected(
+            "PCM24の表現範囲を超えるため、クリップせずFLAC変換を拒否しました"
+        )
+    quantized = quantized.astype(np.int32)
     return np.left_shift(quantized, 8)
 
 
@@ -469,6 +487,103 @@ def _scan_wav_for_flac(wav_path):
     return properties
 
 
+class _AudioFileView:
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        info = sf.info(self.path)
+        self.shape = (int(info.frames), int(info.channels))
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, item):
+        if not isinstance(item, slice) or item.step not in (None, 1):
+            raise TypeError("AudioFileViewは連続スライスだけをサポートします")
+        start = 0 if item.start is None else max(0, int(item.start))
+        stop = self.shape[0] if item.stop is None else min(self.shape[0], int(item.stop))
+        if stop <= start:
+            return np.empty((0, self.shape[1]), dtype=np.float64)
+        with sf.SoundFile(self.path, mode="r") as source:
+            source.seek(start)
+            return source.read(
+                frames=stop - start,
+                dtype="float64",
+                always_2d=True,
+            )
+
+
+def _analyze_audio_file(path):
+    info = sf.info(path)
+    return analyze_audio(_AudioFileView(path), int(info.samplerate))
+
+
+def _resample_to_float64_wav(source_path, target_path, output_rate=DJ_SAMPLE_RATE):
+    source_info = sf.info(source_path)
+    input_rate = int(source_info.samplerate)
+    channels = int(source_info.channels)
+    if input_rate == int(output_rate):
+        raise ValueError("同一レートではSoXRを呼び出しません")
+    stream = soxr.ResampleStream(
+        input_rate,
+        int(output_rate),
+        channels,
+        dtype="float64",
+        quality="VHQ",
+        vr=False,
+    )
+    written = 0
+    with sf.SoundFile(source_path, mode="r") as source, sf.SoundFile(
+        target_path,
+        mode="w",
+        samplerate=int(output_rate),
+        channels=channels,
+        format="WAV",
+        subtype="DOUBLE",
+    ) as output:
+        current = source.read(
+            frames=ANALYSIS_CHUNK_FRAMES,
+            dtype="float64",
+            always_2d=True,
+        )
+        if not len(current):
+            flushed = stream.resample_chunk(
+                np.empty((0, channels), dtype=np.float64),
+                last=True,
+            )
+            if len(flushed):
+                output.write(flushed)
+                written += len(flushed)
+        while len(current):
+            following = source.read(
+                frames=ANALYSIS_CHUNK_FRAMES,
+                dtype="float64",
+                always_2d=True,
+            )
+            converted = stream.resample_chunk(current, last=not len(following))
+            if not np.isfinite(converted).all():
+                raise ValueError("SoXR出力にNaNまたはInfが含まれています")
+            if len(converted):
+                output.write(converted)
+                written += len(converted)
+            current = following
+    expected = round(int(source_info.frames) * int(output_rate) / input_rate)
+    if abs(written - expected) > 1:
+        raise RuntimeError(
+            f"SoXR出力フレーム数が不正です: expected {expected}, actual {written}"
+        )
+    return {
+        "input_sample_rate": input_rate,
+        "output_sample_rate": int(output_rate),
+        "channels": channels,
+        "input_frames": int(source_info.frames),
+        "output_frames": written,
+        "src_engine": SRC_ENGINE,
+        "src_quality": SRC_QUALITY,
+        "src_phase": SRC_PHASE,
+        "soxr_version": getattr(soxr, "__version__", "unknown"),
+    }
+
+
 def _wav_export_metadata(wav_path):
     result = {
         "title": os.path.splitext(os.path.basename(wav_path))[0],
@@ -494,19 +609,50 @@ def _wav_export_metadata(wav_path):
     return result
 
 
-def _tag_flac(flac_path, track_info, artwork_bytes, scan, analysis=None, capture_audit=None):
+def _tag_flac(
+    flac_path,
+    track_info,
+    artwork_bytes,
+    scan,
+    analysis=None,
+    capture_audit=None,
+    processing=None,
+):
     audio = FLAC(flac_path)
+    process = processing or {}
     title = track_info.get("name") or track_info.get("title") or "Unknown"
     artist = track_info.get("artist") or "Unknown"
     album = track_info.get("album") or "Unknown"
     audio["TITLE"] = title
     audio["ARTIST"] = artist
     audio["ALBUM"] = album
-    audio["SOURCE_FORMAT"] = "WAV 32-bit IEEE float"
+    audio["SOURCE_FORMAT"] = "WAV/RF64 IEEE float capture"
     audio["CAPTURE_GAIN"] = "1.0 (Unity Gain)"
-    audio["DITHER"] = "TPDF +/-1 LSB peak before 24-bit quantization"
+    audio["EXPORT_ROLE"] = str(process.get("export_role") or "archive")
+    audio["DITHER"] = str(process.get("dither") or DITHER_NONE)
+    audio["DITHER_REASON"] = str(process.get("dither_reason") or "No dither required")
+    audio["QUANTIZER"] = str(process.get("quantizer") or QUANTIZER)
     audio["BIT_DEPTH"] = str(FLAC_BIT_DEPTH)
     audio["SAMPLE_RATE"] = str(scan["sample_rate"])
+    audio["OUTPUT_SAMPLE_RATE"] = str(scan["sample_rate"])
+    if process.get("source_sample_rate") is not None:
+        audio["SOURCE_SAMPLE_RATE"] = str(process["source_sample_rate"])
+    if process.get("source_bit_depth") is not None:
+        audio["SOURCE_BIT_DEPTH"] = str(process["source_bit_depth"])
+    audio["SOURCE_VERIFIED"] = "YES" if process.get("source_verified") else "NO"
+    if process.get("src_engine"):
+        audio["SRC_ENGINE"] = str(process["src_engine"])
+        audio["SRC_QUALITY"] = str(process.get("src_quality") or SRC_QUALITY)
+        audio["SRC_PHASE"] = str(process.get("src_phase") or SRC_PHASE)
+        audio["SOXR_VERSION"] = str(process.get("soxr_version") or "unknown")
+    else:
+        audio["SRC_ENGINE"] = "BYPASS"
+        audio["SRC_QUALITY"] = "BYPASS"
+        audio["SRC_PHASE"] = "BYPASS"
+    audio["DJ_SAFETY_GAIN_DB"] = f'{float(process.get("safety_gain_db") or 0.0):.6f}'
+    input_true_peak = process.get("input_true_peak_dbtp")
+    if input_true_peak is not None:
+        audio["INPUT_TRUE_PEAK_DBTP"] = format_db(float(input_true_peak))
     if analysis:
         if analysis.get("integrated_lufs") is not None:
             audio["INTEGRATED_LUFS"] = f'{analysis["integrated_lufs"]:.2f}'
@@ -521,6 +667,10 @@ def _tag_flac(flac_path, track_info, artwork_bytes, scan, analysis=None, capture
             capture_audit.get("assurance_label") or "Unknown"
         )
         audio["LOSSLESS_VERIFIED"] = "No - source bits were not available for comparison"
+    if process.get("export_role") == "dj":
+        audio["DERIVATION_NOTICE"] = (
+            "Lossless codec; DSP-derived DJ copy; source bit identity not proven"
+        )
     audio.clear_pictures()
     if artwork_bytes:
         picture = Picture()
@@ -532,7 +682,15 @@ def _tag_flac(flac_path, track_info, artwork_bytes, scan, analysis=None, capture
     audio.save()
 
 
-def _verify_flac(flac_path, expected, expect_artwork, source_wav_path=None):
+def _verify_flac(
+    flac_path,
+    expected,
+    expect_artwork,
+    source_wav_path=None,
+    dither=DITHER_NONE,
+    reference_gain=1.0,
+    export_role="archive",
+):
     info = sf.info(flac_path)
     if info.format != "FLAC" or info.subtype != FLAC_SUBTYPE:
         raise RuntimeError(
@@ -565,43 +723,50 @@ def _verify_flac(flac_path, expected, expect_artwork, source_wav_path=None):
                     )
                     if len(source_chunk) != len(chunk):
                         raise RuntimeError("FLACとWAVの比較フレーム数が一致しません")
-                    max_error = float(np.max(np.abs(source_chunk - chunk)))
-                    if max_error > 2.0 / PCM24_SCALE:
+                    reference = source_chunk * float(reference_gain)
+                    max_error = float(np.max(np.abs(reference - chunk)))
+                    error_limit = (1.500001 if dither == DITHER_TPDF else 0.500001) / PCM24_SCALE
+                    if max_error > error_limit:
                         raise RuntimeError(
-                            f"FLAC量子化誤差がTPDF 24-bit許容値を超えています: {max_error:.9g}"
+                            f"FLAC量子化誤差が24-bit許容値を超えています: {max_error:.9g}"
                         )
     finally:
         if source_file is not None:
             source_file.close()
     metadata = FLAC(flac_path)
-    if metadata.get("DITHER") != ["TPDF +/-1 LSB peak before 24-bit quantization"]:
-        raise RuntimeError("FLACのTPDFディザ証跡を確認できません")
+    if metadata.get("DITHER") != [dither]:
+        raise RuntimeError("FLACのディザ証跡を確認できません")
+    if metadata.get("EXPORT_ROLE") != [export_role]:
+        raise RuntimeError("FLACの出力種別を確認できません")
     if expect_artwork and not metadata.pictures:
         raise RuntimeError("FLACのジャケット画像を確認できません")
 
 
-def write_tpdf_flac(
+def write_pcm24_flac(
     wav_path,
     flac_path,
     track_info=None,
     artwork_bytes=None,
-    analysis=None,
     capture_audit=None,
+    processing=None,
+    dither=DITHER_NONE,
+    gain_db=0.0,
     random_seed=None,
 ):
     source_path = os.path.abspath(os.path.expanduser(wav_path))
     output_path = os.path.abspath(os.path.expanduser(flac_path))
     scan = _scan_wav_for_flac(source_path)
-    if scan["sample_peak"] > 1.0:
-        raise FlacExportRejected(
-            f'Sample Peak {scan["sample_peak_dbfs"]:.2f} dBFSが0 dBFSを超えています'
-        )
     metadata = track_info or _wav_export_metadata(source_path)
     cover = artwork_bytes
     if cover is None and metadata.get("artwork_bytes"):
         cover = metadata["artwork_bytes"]
     temporary_path = f"{output_path}.part"
     rng = np.random.default_rng(random_seed)
+    gain = float(10.0 ** (float(gain_db) / 20.0))
+    process = dict(processing or {})
+    process["dither"] = dither
+    process["quantizer"] = QUANTIZER
+    process["safety_gain_db"] = float(gain_db)
     try:
         with sf.SoundFile(source_path, mode="r") as source, sf.SoundFile(
             temporary_path,
@@ -614,25 +779,30 @@ def write_tpdf_flac(
             while True:
                 chunk = source.read(
                     frames=ANALYSIS_CHUNK_FRAMES,
-                    dtype="float32",
+                    dtype="float64",
                     always_2d=True,
                 )
                 if not len(chunk):
                     break
-                output.write(_tpdf_pcm24(chunk, rng))
+                output.write(_quantize_pcm24(chunk, dither, rng, gain=gain))
+        output_analysis = _analyze_audio_file(temporary_path)
         _tag_flac(
             temporary_path,
             metadata,
             cover,
-            scan,
-            analysis=analysis,
+            {**scan, "sample_rate": int(sf.info(temporary_path).samplerate)},
+            analysis=output_analysis,
             capture_audit=capture_audit,
+            processing=process,
         )
         _verify_flac(
             temporary_path,
             scan,
             bool(cover),
             source_wav_path=source_path,
+            dither=dither,
+            reference_gain=gain,
+            export_role=str(process.get("export_role") or "archive"),
         )
         os.replace(temporary_path, output_path)
         final_info = sf.info(output_path)
@@ -650,6 +820,452 @@ def write_tpdf_flac(
         "artwork_embedded": bool(cover),
         "source_bytes": os.path.getsize(source_path),
         "flac_bytes": os.path.getsize(output_path),
+        "dither": dither,
+        "dither_reason": process.get("dither_reason") or "",
+        "safety_gain_db": float(gain_db),
+        "output_analysis": output_analysis,
+    }
+
+
+def write_tpdf_flac(
+    wav_path,
+    flac_path,
+    track_info=None,
+    artwork_bytes=None,
+    analysis=None,
+    capture_audit=None,
+    random_seed=None,
+):
+    """Compatibility helper. New exports use write_pcm24_flac and policy metadata."""
+    del analysis
+    return write_pcm24_flac(
+        wav_path,
+        flac_path,
+        track_info=track_info,
+        artwork_bytes=artwork_bytes,
+        capture_audit=capture_audit,
+        processing={
+            "export_role": "archive",
+            "dither_reason": "Explicit compatibility TPDF export",
+        },
+        dither=DITHER_TPDF,
+        random_seed=random_seed,
+    )
+
+
+def _resolve_source_policy(
+    capture_audit=None,
+    source_bit_depth=None,
+    source_verified=None,
+):
+    evaluation = (capture_audit or {}).get("source_evaluation") or {}
+    depth = source_bit_depth
+    if depth is None:
+        depth = evaluation.get("source_bit_depth")
+    depth = int(depth) if depth in (16, 24, "16", "24") else None
+    verified = source_verified
+    if verified is None:
+        verified = bool(evaluation.get("source_verified", False))
+    return depth, bool(verified and depth in {16, 24})
+
+
+def _paired_export_paths(source_path, existing=None, archive_target=None):
+    rows = existing or {}
+    archive_existing = rows.get("archive", {}).get("flac_path")
+    dj_existing = rows.get("dj", {}).get("flac_path")
+    if archive_target:
+        archive_path = os.path.abspath(os.path.expanduser(archive_target))
+    elif archive_existing:
+        archive_path = archive_existing
+    else:
+        archive_path = None
+    source_dir = os.path.dirname(source_path)
+    dj_dir = os.path.join(source_dir, "DJ 24-48")
+    os.makedirs(dj_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(source_path))[0]
+    if archive_path is None and dj_existing:
+        archive_path = os.path.join(source_dir, os.path.basename(dj_existing))
+    if archive_path is None:
+        counter = 1
+        while True:
+            suffix = "" if counter == 1 else f" ({counter})"
+            candidate_archive = os.path.join(source_dir, f"{base}{suffix}.flac")
+            candidate_dj = os.path.join(dj_dir, f"{base}{suffix}.flac")
+            if not os.path.exists(candidate_archive) and not os.path.exists(candidate_dj):
+                archive_path = candidate_archive
+                break
+            counter += 1
+    dj_path = dj_existing or os.path.join(dj_dir, os.path.basename(archive_path))
+    return {"archive": archive_path, "dj": dj_path}
+
+
+def auto_export_variants(
+    wav_path,
+    track_info=None,
+    artwork_bytes=None,
+    analysis=None,
+    capture_audit=None,
+    catalog_path=None,
+    log_callback=None,
+    archive_target_path=None,
+    source_bit_depth=None,
+    source_verified=None,
+    random_seed=None,
+):
+    source_path = os.path.abspath(os.path.expanduser(wav_path))
+    if not os.path.isfile(source_path):
+        raise FileNotFoundError(source_path)
+    source_info = sf.info(source_path)
+    source_rate = int(source_info.samplerate)
+    source_depth, depth_verified = _resolve_source_policy(
+        capture_audit,
+        source_bit_depth=source_bit_depth,
+        source_verified=source_verified,
+    )
+    existing_rows = (
+        list_audio_exports_for_source(source_path, database_path=catalog_path)
+        if catalog_path
+        else []
+    )
+    existing = {row["export_role"]: row for row in existing_rows}
+    output_paths = _paired_export_paths(
+        source_path,
+        existing=existing,
+        archive_target=archive_target_path,
+    )
+    source_bytes = os.path.getsize(source_path) if os.path.isfile(source_path) else None
+    source_analysis = analysis or _analyze_audio_file(source_path)
+    catalog_tracking_failed = False
+
+    def persist_status(role, status, process, result=None, reason=""):
+        nonlocal catalog_tracking_failed
+        if not catalog_path:
+            return True
+        output_analysis = (result or {}).get("output_analysis") or {}
+        try:
+            record_audio_export(
+                source_path,
+                output_paths[role],
+                status,
+                export_role=role,
+                reason=reason,
+                source_sample_rate=source_rate,
+                source_bit_depth=source_depth,
+                source_verified=depth_verified,
+                output_sample_rate=int(process["output_sample_rate"]),
+                src_engine=process.get("src_engine"),
+                src_quality=process.get("src_quality"),
+                src_phase=process.get("src_phase"),
+                dither=process["dither"],
+                dither_reason=process["dither_reason"],
+                quantizer=QUANTIZER,
+                safety_gain_db=process.get("safety_gain_db", 0.0),
+                input_true_peak_dbtp=process.get("input_true_peak_dbtp"),
+                output_true_peak_dbtp=output_analysis.get("true_peak_dbtp"),
+                sample_peak_dbfs=output_analysis.get(
+                    "sample_peak_dbfs", source_analysis.get("sample_peak_dbfs")
+                ),
+                artwork_embedded=(result or {}).get("artwork_embedded"),
+                source_bytes=source_bytes,
+                flac_bytes=(result or {}).get("flac_bytes"),
+                wav_deleted=(result or {}).get("wav_deleted", False),
+                database_path=catalog_path,
+            )
+            return True
+        except Exception as exc:
+            catalog_tracking_failed = True
+            if log_callback:
+                log_callback(
+                    f"FLAC履歴更新失敗: {os.path.basename(source_path)} / {role} / {exc}"
+                )
+            return False
+
+    archive_process = {
+        "export_role": "archive",
+        "source_sample_rate": source_rate,
+        "source_bit_depth": source_depth,
+        "source_verified": depth_verified,
+        "output_sample_rate": source_rate,
+        "src_engine": None,
+        "src_quality": None,
+        "src_phase": None,
+        "dither": DITHER_NONE,
+        "dither_reason": "ネイティブレートのアーカイブ: DSPなし・ディザなし",
+        "safety_gain_db": 0.0,
+        "input_true_peak_dbtp": source_analysis.get("true_peak_dbtp"),
+    }
+    results = {}
+
+    archive_existing = existing.get("archive")
+    if (
+        archive_existing
+        and str(archive_existing.get("status", "")).startswith("complete")
+        and archive_existing.get("flac_path")
+        and os.path.isfile(archive_existing["flac_path"])
+    ):
+        results["archive"] = {
+            **archive_existing,
+            "status": "complete_wav_retained",
+            "flac_path": archive_existing["flac_path"],
+            "artwork_embedded": bool(archive_existing.get("artwork_embedded")),
+            "output_analysis": {
+                "true_peak_dbtp": archive_existing.get("output_true_peak_dbtp"),
+                "sample_peak_dbfs": archive_existing.get("sample_peak_dbfs"),
+            },
+        }
+    else:
+        persist_status("archive", "converting", archive_process)
+        try:
+            results["archive"] = write_pcm24_flac(
+                source_path,
+                output_paths["archive"],
+                track_info=track_info,
+                artwork_bytes=artwork_bytes,
+                capture_audit=capture_audit,
+                processing=archive_process,
+                dither=DITHER_NONE,
+                random_seed=random_seed,
+            )
+            results["archive"].update(
+                status="complete_wav_retained",
+                reason="DJ版の検証完了までWAVを保持します",
+                flac_path=output_paths["archive"],
+            )
+            persist_status(
+                "archive",
+                "complete_wav_retained",
+                archive_process,
+                results["archive"],
+                results["archive"]["reason"],
+            )
+        except FlacExportRejected as exc:
+            results["archive"] = {
+                "status": "rejected",
+                "reason": str(exc),
+                "flac_path": None,
+            }
+            persist_status("archive", "rejected", archive_process, reason=str(exc))
+        except Exception as exc:
+            results["archive"] = {
+                "status": "failed",
+                "reason": str(exc),
+                "flac_path": None,
+            }
+            persist_status("archive", "failed", archive_process, reason=str(exc))
+
+    temporary_resample = None
+    dj_process = {
+        "export_role": "dj",
+        "source_sample_rate": source_rate,
+        "source_bit_depth": source_depth,
+        "source_verified": depth_verified,
+        "output_sample_rate": DJ_SAMPLE_RATE,
+        "src_engine": SRC_ENGINE if source_rate != DJ_SAMPLE_RATE else None,
+        "src_quality": SRC_QUALITY if source_rate != DJ_SAMPLE_RATE else None,
+        "src_phase": SRC_PHASE if source_rate != DJ_SAMPLE_RATE else None,
+        "dither": DITHER_NONE,
+        "dither_reason": "DJ版の前処理が完了していません",
+        "safety_gain_db": 0.0,
+        "input_true_peak_dbtp": None,
+    }
+    try:
+        if source_rate == DJ_SAMPLE_RATE:
+            dj_reference = source_path
+            src_metadata = {}
+        else:
+            handle = tempfile.NamedTemporaryFile(
+                prefix=".hires-dj-",
+                suffix=".wav",
+                dir=os.path.dirname(source_path),
+                delete=False,
+            )
+            temporary_resample = handle.name
+            handle.close()
+            src_metadata = _resample_to_float64_wav(
+                source_path,
+                temporary_resample,
+                output_rate=DJ_SAMPLE_RATE,
+            )
+            dj_reference = temporary_resample
+        dj_input_analysis = _analyze_audio_file(dj_reference)
+        input_true_peak = dj_input_analysis.get("true_peak_dbtp", float("-inf"))
+        safety_gain_db = (
+            min(0.0, -1.0 - float(input_true_peak))
+            if np.isfinite(input_true_peak)
+            else 0.0
+        )
+        dsp_applied = source_rate != DJ_SAMPLE_RATE or safety_gain_db < 0.0
+        use_tpdf = depth_verified and source_depth == 24 and dsp_applied
+        dither = DITHER_TPDF if use_tpdf else DITHER_NONE
+        if source_depth == 16:
+            dither_reason = "検証済み16-bitソース: 拡張・DSP後もディザ禁止"
+        elif not depth_verified:
+            dither_reason = "ソースbit深度未検証: 保守的な無ディザ方針"
+        elif not dsp_applied:
+            dither_reason = "検証済み24-bitソース: SRC・Gainなしのためディザ不要"
+        else:
+            dither_reason = "検証済み24-bitソース: DSP後の最終量子化でTPDFを1回適用"
+        dj_process = {
+            "export_role": "dj",
+            "source_sample_rate": source_rate,
+            "source_bit_depth": source_depth,
+            "source_verified": depth_verified,
+            "output_sample_rate": DJ_SAMPLE_RATE,
+            "src_engine": src_metadata.get("src_engine"),
+            "src_quality": src_metadata.get("src_quality"),
+            "src_phase": src_metadata.get("src_phase"),
+            "soxr_version": src_metadata.get("soxr_version"),
+            "dither": dither,
+            "dither_reason": dither_reason,
+            "safety_gain_db": safety_gain_db,
+            "input_true_peak_dbtp": input_true_peak,
+        }
+        dj_existing = existing.get("dj")
+        if (
+            dj_existing
+            and str(dj_existing.get("status", "")).startswith("complete")
+            and dj_existing.get("flac_path")
+            and os.path.isfile(dj_existing["flac_path"])
+        ):
+            results["dj"] = {
+                **dj_existing,
+                "status": "complete_wav_retained",
+                "flac_path": dj_existing["flac_path"],
+                "artwork_embedded": bool(dj_existing.get("artwork_embedded")),
+                "output_analysis": {
+                    "true_peak_dbtp": dj_existing.get("output_true_peak_dbtp"),
+                    "sample_peak_dbfs": dj_existing.get("sample_peak_dbfs"),
+                },
+            }
+        else:
+            persist_status("dj", "converting", dj_process)
+            try:
+                results["dj"] = write_pcm24_flac(
+                    dj_reference,
+                    output_paths["dj"],
+                    track_info=track_info,
+                    artwork_bytes=artwork_bytes,
+                    capture_audit=capture_audit,
+                    processing=dj_process,
+                    dither=dither,
+                    gain_db=safety_gain_db,
+                    random_seed=random_seed,
+                )
+                results["dj"].update(
+                    status="complete_wav_retained",
+                    reason="アーカイブ版の検証完了までWAVを保持します",
+                    flac_path=output_paths["dj"],
+                )
+                persist_status(
+                    "dj",
+                    "complete_wav_retained",
+                    dj_process,
+                    results["dj"],
+                    results["dj"]["reason"],
+                )
+            except FlacExportRejected as exc:
+                results["dj"] = {
+                    "status": "rejected",
+                    "reason": str(exc),
+                    "flac_path": None,
+                }
+                persist_status("dj", "rejected", dj_process, reason=str(exc))
+            except Exception as exc:
+                results["dj"] = {
+                    "status": "failed",
+                    "reason": str(exc),
+                    "flac_path": None,
+                }
+                persist_status("dj", "failed", dj_process, reason=str(exc))
+    except FlacExportRejected as exc:
+        results["dj"] = {
+            "status": "rejected",
+            "reason": str(exc),
+            "flac_path": None,
+        }
+        persist_status("dj", "rejected", dj_process, reason=str(exc))
+    except Exception as exc:
+        results["dj"] = {
+            "status": "failed",
+            "reason": str(exc),
+            "flac_path": None,
+        }
+        persist_status("dj", "failed", dj_process, reason=str(exc))
+    finally:
+        if temporary_resample:
+            try:
+                os.remove(temporary_resample)
+            except FileNotFoundError:
+                pass
+
+    completed = all(
+        results.get(role, {}).get("status", "").startswith("complete")
+        and results[role].get("flac_path")
+        and os.path.isfile(results[role]["flac_path"])
+        for role in ("archive", "dj")
+    )
+    tracking_ok = completed and not catalog_tracking_failed
+    tracking_error = None
+    if completed and catalog_path:
+        try:
+            replace_recording_file(
+                source_path,
+                results["archive"]["flac_path"],
+                database_path=catalog_path,
+            )
+        except Exception as exc:
+            tracking_ok = False
+            tracking_error = exc
+    if tracking_ok:
+        try:
+            os.remove(source_path)
+            wav_deleted = True
+            final_status = "complete"
+            final_reason = ""
+        except OSError as exc:
+            wav_deleted = False
+            final_status = "complete_wav_retained"
+            final_reason = f"両FLACは検証済みですがWAVを削除できません: {exc}"
+    else:
+        wav_deleted = False
+        final_status = "complete_wav_retained" if completed else "partial"
+        if completed and catalog_tracking_failed:
+            final_reason = "両FLACは検証済みですが履歴更新に失敗したためWAVを保持しました"
+        else:
+            final_reason = "アーカイブ版とDJ版の両方が完了していないためWAVを保持しました"
+        if tracking_error is not None:
+            final_reason = f"履歴を確定できないためWAVを保持しました: {tracking_error}"
+
+    for role, process in (("archive", archive_process), ("dj", dj_process)):
+        result = results.get(role, {})
+        if result.get("status", "").startswith("complete"):
+            role_status = final_status if completed else "complete_wav_retained"
+            result["status"] = role_status
+            result["reason"] = final_reason
+            result["wav_deleted"] = wav_deleted
+            persist_status(role, role_status, process, result, final_reason)
+    if log_callback:
+        deletion_text = "WAV削除済み" if wav_deleted else "WAV保持"
+        for role, label in (("archive", "アーカイブ"), ("dj", "DJ 24/48")):
+            item = results.get(role, {})
+            if item.get("status", "").startswith("complete"):
+                process = archive_process if role == "archive" else dj_process
+                log_callback(
+                    f"{label} FLAC保存: {os.path.basename(item['flac_path'])} / "
+                    f"24-bit / {process['dither']} / {deletion_text}"
+                )
+            else:
+                log_callback(
+                    f"{label} FLAC変換{item.get('status', 'failed')}: {item.get('reason', '不明なエラー')}"
+                )
+        if final_reason:
+            log_callback(f"FLAC管理警告: {final_reason}")
+    return {
+        "archive": results.get("archive"),
+        "dj": results.get("dj"),
+        "status": final_status,
+        "reason": final_reason,
+        "wav_deleted": wav_deleted,
     }
 
 
@@ -664,138 +1280,43 @@ def auto_export_flac(
     target_path=None,
     random_seed=None,
 ):
-    source_path = os.path.abspath(os.path.expanduser(wav_path))
-    output_path = target_path or unique_path(
-        os.path.dirname(source_path),
-        os.path.splitext(os.path.basename(source_path))[0] + ".flac",
+    """Compatibility API returning the archive result with variant details."""
+    variants = auto_export_variants(
+        wav_path,
+        track_info=track_info,
+        artwork_bytes=artwork_bytes,
+        analysis=analysis,
+        capture_audit=capture_audit,
+        catalog_path=catalog_path,
+        log_callback=log_callback,
+        archive_target_path=target_path,
+        random_seed=random_seed,
     )
-    source_bytes = os.path.getsize(source_path) if os.path.isfile(source_path) else None
-    peak_dbfs = (analysis or {}).get("sample_peak_dbfs")
-
-    def persist_status(status, **values):
-        if not catalog_path:
-            return True
-        try:
-            record_flac_export(
-                source_path,
-                output_path,
-                status,
-                database_path=catalog_path,
-                **values,
-            )
-            return True
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"FLAC履歴更新失敗: {os.path.basename(source_path)} / {exc}")
-            return False
-
-    persist_status(
-        "converting",
-        sample_peak_dbfs=peak_dbfs,
-        source_bytes=source_bytes,
+    archive = dict(variants.get("archive") or {})
+    archive.update(
+        status=variants["status"],
+        reason=variants["reason"],
+        wav_deleted=variants["wav_deleted"],
+        variants=variants,
     )
-    try:
-        result = write_tpdf_flac(
-            source_path,
-            output_path,
-            track_info=track_info,
-            artwork_bytes=artwork_bytes,
-            analysis=analysis,
-            capture_audit=capture_audit,
-            random_seed=random_seed,
-        )
-    except FlacExportRejected as exc:
-        persist_status(
-            "rejected",
-            reason=str(exc),
-            sample_peak_dbfs=peak_dbfs,
-            source_bytes=source_bytes,
-        )
-        if log_callback:
-            log_callback(f"FLAC変換拒否: {os.path.basename(source_path)} / {exc}")
-        return {"status": "rejected", "reason": str(exc), "flac_path": None}
-    except Exception as exc:
-        persist_status(
-            "failed",
-            reason=str(exc),
-            sample_peak_dbfs=peak_dbfs,
-            source_bytes=source_bytes,
-        )
-        if log_callback:
-            log_callback(f"FLAC変換失敗: {os.path.basename(source_path)} / {exc}")
-        return {"status": "failed", "reason": str(exc), "flac_path": None}
-
-    tracking_ok = persist_status(
-        "complete",
-        sample_peak_dbfs=result["sample_peak_dbfs"],
-        artwork_embedded=result["artwork_embedded"],
-        source_bytes=result["source_bytes"],
-        flac_bytes=result["flac_bytes"],
-    )
-    if catalog_path and tracking_ok:
-        try:
-            replace_recording_file(source_path, output_path, database_path=catalog_path)
-        except Exception as exc:
-            tracking_ok = False
-            tracking_error = exc
-    if not tracking_ok:
-        wav_deleted = False
-        status = "complete_wav_retained"
-        reason = "FLACは検証済みですが履歴を確定できないためWAVを保持しました"
-        if "tracking_error" in locals():
-            reason += f": {tracking_error}"
-    else:
-        try:
-            os.remove(source_path)
-            wav_deleted = True
-            status = "complete"
-            reason = ""
-        except OSError as exc:
-            wav_deleted = False
-            status = "complete_wav_retained"
-            reason = f"FLACは検証済みですがWAVを削除できません: {exc}"
-    persist_status(
-        status,
-        reason=reason,
-        sample_peak_dbfs=result["sample_peak_dbfs"],
-        artwork_embedded=result["artwork_embedded"],
-        source_bytes=result["source_bytes"],
-        flac_bytes=result["flac_bytes"],
-        wav_deleted=wav_deleted,
-    )
-    if log_callback:
-        cover_text = "ジャケット埋込" if result["artwork_embedded"] else "ジャケットなし"
-        deletion_text = "WAV削除済み" if wav_deleted else "WAV保持"
-        log_callback(
-            f"FLAC保存: {os.path.basename(output_path)} / 24-bit TPDF / "
-            f"{cover_text} / {deletion_text}"
-        )
-        if reason:
-            log_callback(f"FLAC管理警告: {reason}")
-    return {
-        **result,
-        "status": status,
-        "reason": reason,
-        "wav_deleted": wav_deleted,
-    }
+    return archive
 
 
 def retry_flac_export(export_item, catalog_path, log_callback=None):
     source_path = export_item["source_wav_path"]
     if not os.path.isfile(source_path):
         reason = "変換元WAVが見つかりません"
-        record_flac_export(
+        record_audio_export(
             source_path,
             export_item.get("flac_path"),
             "failed",
+            export_role=export_item.get("export_role") or "archive",
             reason=reason,
             database_path=catalog_path,
         )
         return {"status": "failed", "reason": reason, "flac_path": None}
     metadata = _wav_export_metadata(source_path)
-    existing_target = export_item.get("flac_path")
-    target_path = existing_target if existing_target and not os.path.exists(existing_target) else None
-    return auto_export_flac(
+    return auto_export_variants(
         source_path,
         track_info={
             "name": metadata["title"],
@@ -805,7 +1326,8 @@ def retry_flac_export(export_item, catalog_path, log_callback=None):
         artwork_bytes=metadata.get("artwork_bytes"),
         catalog_path=catalog_path,
         log_callback=log_callback,
-        target_path=target_path,
+        source_bit_depth=export_item.get("source_bit_depth"),
+        source_verified=export_item.get("source_verified"),
     )
 
 
@@ -1318,7 +1840,7 @@ def process_and_save_candidates(candidates, options, log_callback, on_finish):
                 for warning in analysis["warnings"]:
                     log_callback(f"品質警告: {os.path.basename(final_path)} / {warning}")
                 if options.get("auto_flac_export", True):
-                    auto_export_flac(
+                    auto_export_variants(
                         final_path,
                         track_info=track,
                         artwork_bytes=artwork_bytes,

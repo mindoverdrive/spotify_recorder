@@ -4,7 +4,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def legacy_catalog_path():
@@ -161,6 +161,57 @@ def _connect(database_path):
         connection,
         "flac_exports",
         {"wav_deleted": "INTEGER NOT NULL DEFAULT 0"},
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audio_exports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recording_id INTEGER,
+            source_wav_path TEXT NOT NULL,
+            flac_path TEXT,
+            export_role TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            source_sample_rate INTEGER,
+            source_bit_depth INTEGER,
+            source_verified INTEGER,
+            output_sample_rate INTEGER,
+            output_bit_depth INTEGER NOT NULL DEFAULT 24,
+            src_engine TEXT,
+            src_quality TEXT,
+            src_phase TEXT,
+            dither TEXT NOT NULL DEFAULT 'NONE',
+            dither_reason TEXT NOT NULL DEFAULT '',
+            quantizer TEXT NOT NULL DEFAULT 'ROUND_TO_NEAREST_EVEN',
+            safety_gain_db REAL NOT NULL DEFAULT 0.0,
+            input_true_peak_dbtp REAL,
+            output_true_peak_dbtp REAL,
+            sample_peak_dbfs REAL,
+            artwork_embedded INTEGER,
+            source_bytes INTEGER,
+            flac_bytes INTEGER,
+            wav_deleted INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(recording_id) REFERENCES recordings(id) ON DELETE SET NULL,
+            UNIQUE(source_wav_path, export_role)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO audio_exports (
+            recording_id, source_wav_path, flac_path, export_role, status,
+            reason, output_bit_depth, dither, dither_reason, quantizer,
+            sample_peak_dbfs, artwork_embedded, source_bytes, flac_bytes,
+            wav_deleted, created_at, updated_at
+        )
+        SELECT recording_id, source_wav_path, flac_path, 'archive', status,
+               reason, bit_depth, dither, 'Legacy FLAC export',
+               'LEGACY_TPDF_QUANTIZER', sample_peak_dbfs, artwork_embedded,
+               source_bytes, flac_bytes, wav_deleted, created_at, updated_at
+        FROM flac_exports
+        """
     )
     connection.execute(
         """
@@ -362,11 +413,26 @@ def record_saved_recording(
     return recording_id
 
 
-def record_flac_export(
+def record_audio_export(
     source_wav_path,
     flac_path,
     status,
+    export_role="archive",
     reason="",
+    source_sample_rate=None,
+    source_bit_depth=None,
+    source_verified=None,
+    output_sample_rate=None,
+    output_bit_depth=24,
+    src_engine=None,
+    src_quality=None,
+    src_phase=None,
+    dither="NONE",
+    dither_reason="",
+    quantizer="ROUND_TO_NEAREST_EVEN",
+    safety_gain_db=0.0,
+    input_true_peak_dbtp=None,
+    output_true_peak_dbtp=None,
     sample_peak_dbfs=None,
     artwork_embedded=None,
     source_bytes=None,
@@ -388,24 +454,41 @@ def record_flac_export(
             recording_id = row[0]
         else:
             existing = connection.execute(
-                "SELECT recording_id FROM flac_exports WHERE source_wav_path = ?",
+                "SELECT recording_id FROM audio_exports WHERE source_wav_path = ? "
+                "AND recording_id IS NOT NULL LIMIT 1",
                 (source_path,),
             ).fetchone()
             recording_id = existing[0] if existing else None
         connection.execute(
             """
-            INSERT INTO flac_exports (
-                recording_id, source_wav_path, flac_path, status, reason,
-                bit_depth, dither, sample_peak_dbfs, artwork_embedded,
-                source_bytes, flac_bytes, wav_deleted, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 24, 'TPDF', ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source_wav_path) DO UPDATE SET
+            INSERT INTO audio_exports (
+                recording_id, source_wav_path, flac_path, export_role, status,
+                reason, source_sample_rate, source_bit_depth, source_verified,
+                output_sample_rate, output_bit_depth, src_engine, src_quality,
+                src_phase, dither, dither_reason, quantizer, safety_gain_db,
+                input_true_peak_dbtp, output_true_peak_dbtp, sample_peak_dbfs,
+                artwork_embedded, source_bytes, flac_bytes, wav_deleted,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_wav_path, export_role) DO UPDATE SET
                 recording_id=excluded.recording_id,
                 flac_path=excluded.flac_path,
                 status=excluded.status,
                 reason=excluded.reason,
-                bit_depth=excluded.bit_depth,
+                source_sample_rate=excluded.source_sample_rate,
+                source_bit_depth=excluded.source_bit_depth,
+                source_verified=excluded.source_verified,
+                output_sample_rate=excluded.output_sample_rate,
+                output_bit_depth=excluded.output_bit_depth,
+                src_engine=excluded.src_engine,
+                src_quality=excluded.src_quality,
+                src_phase=excluded.src_phase,
                 dither=excluded.dither,
+                dither_reason=excluded.dither_reason,
+                quantizer=excluded.quantizer,
+                safety_gain_db=excluded.safety_gain_db,
+                input_true_peak_dbtp=excluded.input_true_peak_dbtp,
+                output_true_peak_dbtp=excluded.output_true_peak_dbtp,
                 sample_peak_dbfs=excluded.sample_peak_dbfs,
                 artwork_embedded=excluded.artwork_embedded,
                 source_bytes=excluded.source_bytes,
@@ -417,8 +500,23 @@ def record_flac_export(
                 recording_id,
                 source_path,
                 output_path,
+                str(export_role),
                 str(status),
                 str(reason or ""),
+                source_sample_rate,
+                source_bit_depth,
+                None if source_verified is None else int(bool(source_verified)),
+                output_sample_rate,
+                int(output_bit_depth),
+                src_engine,
+                src_quality,
+                src_phase,
+                str(dither),
+                str(dither_reason or ""),
+                str(quantizer),
+                float(safety_gain_db or 0.0),
+                input_true_peak_dbtp,
+                output_true_peak_dbtp,
                 sample_peak_dbfs,
                 None if artwork_embedded is None else int(bool(artwork_embedded)),
                 source_bytes,
@@ -430,13 +528,44 @@ def record_flac_export(
         )
 
 
+def record_flac_export(
+    source_wav_path,
+    flac_path,
+    status,
+    reason="",
+    sample_peak_dbfs=None,
+    artwork_embedded=None,
+    source_bytes=None,
+    flac_bytes=None,
+    wav_deleted=False,
+    database_path=None,
+):
+    """Compatibility wrapper for pre-v4 callers and migrated history."""
+    return record_audio_export(
+        source_wav_path,
+        flac_path,
+        status,
+        export_role="archive",
+        reason=reason,
+        dither="TPDF",
+        dither_reason="Legacy FLAC export",
+        sample_peak_dbfs=sample_peak_dbfs,
+        artwork_embedded=artwork_embedded,
+        source_bytes=source_bytes,
+        flac_bytes=flac_bytes,
+        wav_deleted=wav_deleted,
+        database_path=database_path,
+    )
+
+
 def replace_recording_file(source_wav_path, flac_path, database_path=None):
     source_path = os.path.abspath(os.path.expanduser(source_wav_path))
     output_path = os.path.abspath(os.path.expanduser(flac_path))
     target = database_path or default_catalog_path()
     with _connect(target) as connection:
         row = connection.execute(
-            "SELECT recording_id FROM flac_exports WHERE source_wav_path = ?",
+            "SELECT recording_id FROM audio_exports WHERE source_wav_path = ? "
+            "AND export_role = 'archive'",
             (source_path,),
         ).fetchone()
         recording_id = row[0] if row else None
@@ -451,14 +580,15 @@ def replace_recording_file(source_wav_path, flac_path, database_path=None):
                 (output_path, os.path.basename(output_path), recording_id),
             )
             connection.execute(
-                "UPDATE flac_exports SET recording_id = ? WHERE source_wav_path = ?",
+                "UPDATE audio_exports SET recording_id = ? WHERE source_wav_path = ?",
                 (recording_id, source_path),
             )
 
 
-def list_flac_exports(
+def list_audio_exports(
     query="",
     status=None,
+    export_role=None,
     limit=500,
     database_path=None,
 ):
@@ -475,9 +605,12 @@ def list_flac_exports(
     if status:
         conditions.append("e.status = :status")
         parameters["status"] = str(status)
+    if export_role:
+        conditions.append("e.export_role = :export_role")
+        parameters["export_role"] = str(export_role)
     sql = (
         "SELECT e.*, r.title, r.artist, r.album, r.provider, r.source_mode "
-        "FROM flac_exports e LEFT JOIN recordings r ON r.id = e.recording_id WHERE "
+        "FROM audio_exports e LEFT JOIN recordings r ON r.id = e.recording_id WHERE "
         + " AND ".join(conditions)
         + " ORDER BY e.updated_at DESC, e.id DESC LIMIT :limit"
     )
@@ -486,12 +619,34 @@ def list_flac_exports(
     exports = []
     for row in rows:
         item = dict(row)
+        item.setdefault("bit_depth", item.get("output_bit_depth"))
         item["source_exists"] = os.path.isfile(item["source_wav_path"])
         item["flac_exists"] = bool(
             item.get("flac_path") and os.path.isfile(item["flac_path"])
         )
         exports.append(item)
     return exports
+
+
+def list_audio_exports_for_source(source_wav_path, database_path=None):
+    source_path = os.path.abspath(os.path.expanduser(source_wav_path))
+    target = database_path or default_catalog_path()
+    with _connect(target) as connection:
+        rows = connection.execute(
+            "SELECT * FROM audio_exports WHERE source_wav_path = ? ORDER BY id",
+            (source_path,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_flac_exports(query="", status=None, limit=500, database_path=None):
+    """Compatibility alias used by older UI and integrations."""
+    return list_audio_exports(
+        query=query,
+        status=status,
+        limit=limit,
+        database_path=database_path,
+    )
 
 
 def list_recordings(

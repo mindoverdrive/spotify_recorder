@@ -19,7 +19,7 @@ from capture_spool import (
     list_recoverable_sessions,
 )
 from coreaudio_devices import resolve_coreaudio_device
-from recording_catalog import default_catalog_path, list_flac_exports, list_recordings
+from recording_catalog import default_catalog_path, list_audio_exports, list_recordings
 from spotify_recorder_services import (
     MODE_PRESETS,
     MODE_ALBUM,
@@ -196,7 +196,7 @@ class HiResRecorderApp(ctk.CTk):
 
         self.quality_label = ctk.CTkLabel(
             controls_frame,
-            text="WAV FLOAT capture -> FLAC 24-bit TPDF / Unity Gain",
+            text="Archive: native-rate 24-bit / DJ: 24-bit 48kHz / conditional dither",
             fg_color="#252b33",
             corner_radius=5,
         )
@@ -304,7 +304,7 @@ class HiResRecorderApp(ctk.CTk):
         ctk.CTkLabel(log_header, text="Log", text_color="#b7bec8").pack(side="left")
         self.history_btn = ctk.CTkButton(
             log_header,
-            text="録音/FLAC",
+            text="録音/出力",
             height=24,
             width=82,
             command=self.show_recording_history,
@@ -714,7 +714,7 @@ class HiResRecorderApp(ctk.CTk):
             self.stream.start()
             self.log_message(
                 f"Audio stream started: {self.sample_rate}Hz / ch {start_ch}-{start_ch + 1} / "
-                "Unity Gain 1.0 / WAV FLOAT capture -> FLAC 24-bit TPDF"
+                "Unity Gain 1.0 / Archive native-rate + DJ 24-bit 48kHz"
             )
             if self.sample_rate != DEFAULT_SAMPLE_RATE:
                 self.log_message(
@@ -789,7 +789,7 @@ class HiResRecorderApp(ctk.CTk):
         )
         if not disk["ok"]:
             self.log_message(
-                "録音開始拒否: スプールと最終WAV用の空き容量が不足しています "
+                "録音開始拒否: スプール、SRC一時領域、Archive/DJ出力用の空き容量が不足しています "
                 f"(必要 {disk['required_bytes'] / 1024**3:.1f} GiB)"
             )
             return
@@ -1059,7 +1059,7 @@ class HiResRecorderApp(ctk.CTk):
 
     def show_recording_history(self):
         history_win = ctk.CTkToplevel(self)
-        history_win.title("録音・FLAC管理")
+        history_win.title("録音・出力管理")
         history_win.geometry("980x700")
         history_win.minsize(820, 560)
         history_win.transient(self)
@@ -1067,7 +1067,7 @@ class HiResRecorderApp(ctk.CTk):
         tabs = ctk.CTkTabview(history_win)
         tabs.pack(fill="both", expand=True, padx=12, pady=12)
         recordings_tab = tabs.add("録音履歴")
-        flac_tab = tabs.add("FLAC管理")
+        flac_tab = tabs.add("FLAC出力")
 
         toolbar = ctk.CTkFrame(recordings_tab, fg_color="transparent")
         toolbar.pack(fill="x", padx=10, pady=(8, 8))
@@ -1272,6 +1272,7 @@ class HiResRecorderApp(ctk.CTk):
         flac_toolbar.pack(fill="x", padx=10, pady=(8, 8))
         flac_query_var = ctk.StringVar()
         flac_status_filter = ctk.StringVar(value="すべて")
+        flac_role_filter = ctk.StringVar(value="すべて")
         flac_search_entry = ctk.CTkEntry(
             flac_toolbar,
             textvariable=flac_query_var,
@@ -1292,9 +1293,19 @@ class HiResRecorderApp(ctk.CTk):
         ).pack(side="left", padx=8)
         ctk.CTkLabel(
             flac_filter_bar,
-            text="成功時のみ検証後にWAVを自動削除",
+            text="ArchiveとDJ版の両方を検証後にWAVを削除",
             text_color="#aab2bd",
         ).pack(side="right")
+
+        flac_role_bar = ctk.CTkFrame(flac_tab, fg_color="transparent")
+        flac_role_bar.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkLabel(flac_role_bar, text="出力").pack(side="left")
+        ctk.CTkSegmentedButton(
+            flac_role_bar,
+            values=["すべて", "Archive", "DJ 24/48"],
+            variable=flac_role_filter,
+            command=lambda _value: render_flac(),
+        ).pack(side="left", padx=8)
 
         flac_scroll = ctk.CTkScrollableFrame(flac_tab, fg_color="#11151a")
         flac_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -1317,8 +1328,14 @@ class HiResRecorderApp(ctk.CTk):
             for child in flac_scroll.winfo_children():
                 child.destroy()
             try:
-                exports = list_flac_exports(
+                selected_role = flac_role_filter.get()
+                export_role = {
+                    "Archive": "archive",
+                    "DJ 24/48": "dj",
+                }.get(selected_role)
+                exports = list_audio_exports(
                     flac_query_var.get(),
+                    export_role=export_role,
                     database_path=self.catalog_path,
                 )
                 selected_status = flac_status_filter.get()
@@ -1346,6 +1363,7 @@ class HiResRecorderApp(ctk.CTk):
             status_labels = {
                 "complete": ("完了・WAV削除済み", "#63f08f"),
                 "complete_wav_retained": ("完了・WAV残存", "#f0b429"),
+                "partial": ("一部完了", "#f0b429"),
                 "converting": ("変換中", "#58a6ff"),
                 "rejected": ("拒否", "#ff5964"),
                 "failed": ("失敗", "#ff5964"),
@@ -1375,9 +1393,18 @@ class HiResRecorderApp(ctk.CTk):
                     if item.get("artwork_embedded")
                     else "ジャケットなし"
                 )
+                role_text = "Archive" if item.get("export_role") == "archive" else "DJ 24/48"
+                source_rate = item.get("source_sample_rate") or "?"
+                output_rate = item.get("output_sample_rate") or "?"
+                src_text = (
+                    "SRC Bypass"
+                    if not item.get("src_engine")
+                    else f"{item.get('src_quality') or item['src_engine']} {item.get('src_phase') or '?'}"
+                )
+                gain_text = f"Gain {float(item.get('safety_gain_db') or 0.0):.3f} dB"
                 details = (
-                    f"24-bit FLAC / {item.get('dither') or 'TPDF'}{size_text} / "
-                    f"{artwork_text}"
+                    f"{role_text} / 24-bit FLAC / {source_rate} -> {output_rate} Hz / "
+                    f"Dither {item.get('dither') or 'NONE'} / {src_text} / {gain_text}"
                 )
                 ctk.CTkLabel(
                     row,
@@ -1392,8 +1419,18 @@ class HiResRecorderApp(ctk.CTk):
                     row,
                     text=details,
                     anchor="w",
+                    justify="left",
                     text_color="#aab2bd",
-                ).grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 7))
+                    wraplength=620,
+                ).grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 2))
+                ctk.CTkLabel(
+                    row,
+                    text=f"{item.get('dither_reason') or '処理理由なし'}{size_text} / {artwork_text}",
+                    anchor="w",
+                    justify="left",
+                    text_color="#808995",
+                    wraplength=620,
+                ).grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 7))
                 if item.get("reason"):
                     ctk.CTkLabel(
                         row,
@@ -1402,10 +1439,10 @@ class HiResRecorderApp(ctk.CTk):
                         justify="left",
                         text_color="#ff9b9b",
                         wraplength=650,
-                    ).grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
+                    ).grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 8))
 
                 button_frame = ctk.CTkFrame(row, fg_color="transparent")
-                button_frame.grid(row=1, column=1, rowspan=2, sticky="e", padx=8, pady=6)
+                button_frame.grid(row=1, column=1, rowspan=3, sticky="e", padx=8, pady=6)
                 flac_state = "normal" if item.get("flac_exists") else "disabled"
                 ctk.CTkButton(
                     button_frame,

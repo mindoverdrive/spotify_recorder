@@ -42,13 +42,15 @@ def check_capture_disk_space(
     output_free = shutil.disk_usage(output_dir).free
     same_volume = os.stat(cache_dir).st_dev == os.stat(output_dir).st_dev
     if same_volume:
-        required_on_volume = required * 3 + int(reserve_bytes)
+        # Raw spool, float WAV, float64 DJ SRC work file, and two verified FLACs
+        # can coexist until the export transaction finishes.
+        required_on_volume = required * 6 + int(reserve_bytes)
         ok = cache_free >= required_on_volume
         cache_required = required_on_volume
         output_required = required_on_volume
     else:
         cache_required = required + int(reserve_bytes)
-        output_required = required * 2 + int(reserve_bytes)
+        output_required = required * 5 + int(reserve_bytes)
         required_on_volume = max(cache_required, output_required)
         ok = cache_free >= cache_required and output_free >= output_required
     return {

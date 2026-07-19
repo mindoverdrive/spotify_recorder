@@ -148,6 +148,27 @@ class QobuzGateTests(unittest.TestCase):
         self.assertTrue(result["source_verified"])
         self.assertIn("bit一致未証明", result["assurance_label"])
 
+    def test_accepts_every_supported_qobuz_rate_when_device_matches(self):
+        for sample_rate in (44100, 48000, 88200, 96000, 176400, 192000):
+            with self.subTest(sample_rate=sample_rate):
+                snapshot = {
+                    **self.snapshot,
+                    "source_sample_rate": sample_rate,
+                    "format_id": 7 if sample_rate <= 96000 else 27,
+                }
+                device = {**self.device, "nominal_sample_rate": sample_rate}
+                result = evaluate_qobuz_capture_gate(snapshot, device)
+                self.assertTrue(result["conditions_pass"], result["warnings"])
+
+        cd_snapshot = {
+            **self.snapshot,
+            "source_sample_rate": 44100,
+            "source_bit_depth": 16,
+            "format_id": 6,
+        }
+        cd_device = {**self.device, "nominal_sample_rate": 44100}
+        self.assertTrue(evaluate_qobuz_capture_gate(cd_snapshot, cd_device)["conditions_pass"])
+
     def test_rejects_incomplete_mismatch_and_aggregate(self):
         snapshot = {
             **self.snapshot,
