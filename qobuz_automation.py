@@ -47,6 +47,9 @@ def _normalized(value):
 class MacOSQobuzAccessibility:
     """Read Qobuz AX elements in-process so one app permission is sufficient."""
 
+    def __init__(self):
+        self._prompted = False
+
     def _running_application(self):
         applications = AppKit.NSRunningApplication.runningApplicationsWithBundleIdentifier_(
             QOBUZ_BUNDLE_ID
@@ -77,19 +80,34 @@ class MacOSQobuzAccessibility:
     def _main_window(self):
         application = self._running_application()
         app_element = AS.AXUIElementCreateApplication(application.processIdentifier())
-        windows = self._attribute(app_element, AS.kAXWindowsAttribute, ())
-        if not windows:
-            raise QobuzAutomationError("Qobuzウィンドウを取得できません")
-        return windows[0]
+        
+        for _ in range(15):
+            main_window = self._attribute(app_element, AS.kAXMainWindowAttribute)
+            if main_window:
+                return main_window
+            windows = self._attribute(app_element, AS.kAXWindowsAttribute, ())
+            if windows:
+                for window in windows:
+                    if self._attribute(window, AS.kAXRoleAttribute) == AS.kAXWindowRole:
+                        return window
+                return windows[0]
+            
+            subprocess.run(["open", "-a", "Qobuz"], check=False)
+            time.sleep(0.2)
+            
+        raise QobuzAutomationError("Qobuzウィンドウを取得できません。Qobuzの画面が開いているか確認してください")
 
     def check(self):
         if not AS.AXIsProcessTrusted():
-            AS.AXIsProcessTrustedWithOptions(
-                {AS.kAXTrustedCheckOptionPrompt: True}
-            )
+            if not self._prompted:
+                AS.AXIsProcessTrustedWithOptions(
+                    {AS.kAXTrustedCheckOptionPrompt: True}
+                )
+                self._prompted = True
             raise QobuzAutomationError(
-                "Hi-Res Recorderのアクセシビリティ許可が必要です。"
-                "システム設定で許可後、事前検査をやり直してください"
+                "Hi-Res Recorderのアクセシビリティ許可が必要です。\n"
+                "システム設定で許可後、アプリを再起動してください。\n"
+                "（ループする場合はシステム設定から一度「-」で削除し、再度追加してください）"
             )
         role = self._attribute(self._main_window(), AS.kAXRoleAttribute)
         if role != AS.kAXWindowRole:
@@ -113,15 +131,21 @@ class MacOSQobuzAccessibility:
         children.extend(rows)
         return children
 
-    def _all_items(self, limit=20000):
+    def _iter_items(self, limit=20000):
         pending = [self._main_window()]
-        items = []
+        count = 0
         while pending:
             element = pending.pop()
-            items.append(element)
-            if len(items) > limit:
-                raise QobuzAutomationError("Qobuz Accessibility要素数が上限を超えました")
+            yield element
+            count += 1
+            if count > limit:
+                break
             pending.extend(reversed(self._children(element)))
+
+    def _all_items(self, limit=20000):
+        items = list(self._iter_items(limit=limit))
+        if len(items) >= limit:
+            raise QobuzAutomationError("Qobuz Accessibility要素数が上限を超えました")
         return items
 
     def _role(self, element):
@@ -184,9 +208,8 @@ class MacOSQobuzAccessibility:
         x, y, width, height = frame
         return x + (width / 2.0), y + (height / 2.0)
 
-    def _find_exact_text(self, items, target, role=None, visible=False):
+    def _find_exact_text_iter(self, items, target, role=None, visible=False):
         target = _normalized(target)
-        matches = []
         for item in items:
             if role and self._role(item) != role:
                 continue
@@ -194,16 +217,22 @@ class MacOSQobuzAccessibility:
                 continue
             if visible and self._center(item) is None:
                 continue
-            matches.append(item)
-        return matches
+            yield item
+
+    def _find_exact_text(self, items, target, role=None, visible=False):
+        return list(self._find_exact_text_iter(items, target, role=role, visible=visible))
 
     def track_play_point(self, title, track_number):
         self.activate()
-        items = self._all_items()
-        labels = self._find_exact_text(items, title)
-        if not labels:
+        label = None
+        for item in self._find_exact_text_iter(self._iter_items(limit=5000), title):
+            if self._center(item):
+                label = item
+                break
+            if label is None:
+                label = item
+        if not label:
             raise QobuzAutomationError("Qobuzアルバム画面に対象曲が見つかりません")
-        label = next((item for item in labels if self._center(item)), labels[0])
         try:
             AS.AXUIElementPerformAction(
                 label, AS.NSAccessibilityScrollToVisibleAction
@@ -212,28 +241,33 @@ class MacOSQobuzAccessibility:
             pass
         time.sleep(0.5)
 
-        items = self._all_items()
-        labels = self._find_exact_text(items, title, visible=True)
-        if not labels:
+        visible_label = None
+        for item in self._find_exact_text_iter(self._iter_items(limit=5000), title, visible=True):
+            visible_label = item
+            break
+        if not visible_label:
             raise QobuzAutomationError("Qobuz対象曲を表示領域へ移動できません")
-        label_frame = self._frame(labels[0])
+            
+        label_frame = self._frame(visible_label)
         label_x, label_y = label_frame[0], label_frame[1]
         target_number = _normalized(track_number)
         buttons = []
-        for item in items:
+        for item in self._iter_items(limit=5000):
             if self._role(item) != AS.kAXButtonRole:
                 continue
             frame = self._frame(item)
             if frame is None or frame[2] <= 0 or frame[3] <= 0:
+                continue
+            if frame[0] >= label_x or abs(frame[1] - label_y) > 24:
                 continue
             texts = tuple(text.lower() for text in self._texts(item))
             if not any(
                 text in {target_number.lower(), "再生", "play"} for text in texts
             ):
                 continue
-            if frame[0] >= label_x or abs(frame[1] - label_y) > 24:
-                continue
             buttons.append((frame[0], item))
+            if len(buttons) >= 5:
+                break
         if not buttons:
             raise QobuzAutomationError("Qobuz対象曲の再生ボタンが見つかりません")
         buttons.sort(key=lambda entry: entry[0], reverse=True)
@@ -241,24 +275,20 @@ class MacOSQobuzAccessibility:
 
     def output_button_point(self):
         self.activate()
-        items = self._all_items()
-        matches = self._find_exact_text(
-            items, "\ue903", role=AS.kAXStaticTextRole, visible=True
-        )
-        if not matches:
-            raise QobuzAutomationError("Qobuzのオーディオ出力ボタンが見つかりません")
-        return self._center(matches[0])
+        for match in self._find_exact_text_iter(
+            self._iter_items(limit=3000), "\ue903", role=AS.kAXStaticTextRole, visible=True
+        ):
+            return self._center(match)
+        raise QobuzAutomationError("Qobuzのオーディオ出力ボタンが見つかりません")
 
     def output_device_point(self, device_name):
-        items = self._all_items()
-        matches = self._find_exact_text(
-            items, device_name, role=AS.kAXStaticTextRole, visible=True
+        for match in self._find_exact_text_iter(
+            self._iter_items(limit=3000), device_name, role=AS.kAXStaticTextRole, visible=True
+        ):
+            return self._center(match)
+        raise QobuzAutomationError(
+            f"Qobuzの出力一覧に{device_name}が見つかりません"
         )
-        if not matches:
-            raise QobuzAutomationError(
-                f"Qobuzの出力一覧に{device_name}が見つかりません"
-            )
-        return self._center(matches[0])
 
     def visible_text_diagnostics(self, limit=80):
         diagnostics = []
@@ -333,14 +363,43 @@ class QobuzAutomation:
         return (result.stdout or "").strip()
 
     def ensure_running(self):
-        if not qobuz_is_running():
-            self._run(["open", "-a", "Qobuz"])
+        running = qobuz_is_running()
+        needs_restart = False
+
+        if running:
+            try:
+                has_web_area = False
+                for item in self.accessibility._iter_items(limit=1000):
+                    if self.accessibility._role(item) == AS.kAXWebAreaRole:
+                        has_web_area = True
+                        break
+                if not has_web_area:
+                    needs_restart = True
+            except Exception:
+                needs_restart = True
+                
+        if needs_restart:
+            try:
+                subprocess.run(["killall", "Qobuz"], check=False, capture_output=True)
+            except Exception:
+                pass
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if not qobuz_is_running():
+                    break
+                self.sleep(0.5)
+            running = False
+
+        if not running:
+            self._run(["open", "-a", "Qobuz", "--args", "--force-renderer-accessibility"])
             deadline = time.monotonic() + 15.0
             while time.monotonic() < deadline:
                 if qobuz_is_running():
-                    return
-                self.sleep(0.2)
-            raise QobuzAutomationError("Qobuzアプリを起動できません")
+                    break
+                self.sleep(0.5)
+            else:
+                raise QobuzAutomationError("Qobuzアプリを起動できません")
+            self.sleep(4.0)
 
     def check_accessibility(self):
         self.ensure_running()
