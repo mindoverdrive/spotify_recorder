@@ -225,12 +225,16 @@ class MacOSQobuzAccessibility:
     def track_play_point(self, title, track_number):
         self.activate()
         label = None
-        for item in self._find_exact_text_iter(self._iter_items(limit=5000), title):
-            if self._center(item):
-                label = item
+        for _ in range(20):
+            for item in self._find_exact_text_iter(self._iter_items(limit=10000), title):
+                if self._center(item):
+                    label = item
+                    break
+                if label is None:
+                    label = item
+            if label:
                 break
-            if label is None:
-                label = item
+            time.sleep(0.5)
         if not label:
             raise QobuzAutomationError("Qobuzアルバム画面に対象曲が見つかりません")
         try:
@@ -242,9 +246,13 @@ class MacOSQobuzAccessibility:
         time.sleep(0.5)
 
         visible_label = None
-        for item in self._find_exact_text_iter(self._iter_items(limit=5000), title, visible=True):
-            visible_label = item
-            break
+        for _ in range(10):
+            for item in self._find_exact_text_iter(self._iter_items(limit=10000), title, visible=True):
+                visible_label = item
+                break
+            if visible_label:
+                break
+            time.sleep(0.5)
         if not visible_label:
             raise QobuzAutomationError("Qobuz対象曲を表示領域へ移動できません")
             
@@ -252,22 +260,26 @@ class MacOSQobuzAccessibility:
         label_x, label_y = label_frame[0], label_frame[1]
         target_number = _normalized(track_number)
         buttons = []
-        for item in self._iter_items(limit=5000):
-            if self._role(item) != AS.kAXButtonRole:
-                continue
-            frame = self._frame(item)
-            if frame is None or frame[2] <= 0 or frame[3] <= 0:
-                continue
-            if frame[0] >= label_x or abs(frame[1] - label_y) > 24:
-                continue
-            texts = tuple(text.lower() for text in self._texts(item))
-            if not any(
-                text in {target_number.lower(), "再生", "play"} for text in texts
-            ):
-                continue
-            buttons.append((frame[0], item))
-            if len(buttons) >= 5:
+        for _ in range(10):
+            for item in self._iter_items(limit=10000):
+                if self._role(item) != AS.kAXButtonRole:
+                    continue
+                frame = self._frame(item)
+                if frame is None or frame[2] <= 0 or frame[3] <= 0:
+                    continue
+                if frame[0] >= label_x or abs(frame[1] - label_y) > 24:
+                    continue
+                texts = tuple(text.lower() for text in self._texts(item))
+                if not any(
+                    text in {target_number.lower(), "再生", "play"} for text in texts
+                ):
+                    continue
+                buttons.append((frame[0], item))
+                if len(buttons) >= 5:
+                    break
+            if buttons:
                 break
+            time.sleep(0.5)
         if not buttons:
             raise QobuzAutomationError("Qobuz対象曲の再生ボタンが見つかりません")
         buttons.sort(key=lambda entry: entry[0], reverse=True)
@@ -275,17 +287,21 @@ class MacOSQobuzAccessibility:
 
     def output_button_point(self):
         self.activate()
-        for match in self._find_exact_text_iter(
-            self._iter_items(limit=3000), "\ue903", role=AS.kAXStaticTextRole, visible=True
-        ):
-            return self._center(match)
+        for _ in range(20):
+            for match in self._find_exact_text_iter(
+                self._iter_items(limit=10000), "\ue903", role=AS.kAXStaticTextRole, visible=True
+            ):
+                return self._center(match)
+            time.sleep(0.5)
         raise QobuzAutomationError("Qobuzのオーディオ出力ボタンが見つかりません")
 
     def output_device_point(self, device_name):
-        for match in self._find_exact_text_iter(
-            self._iter_items(limit=3000), device_name, role=AS.kAXStaticTextRole, visible=True
-        ):
-            return self._center(match)
+        for _ in range(20):
+            for match in self._find_exact_text_iter(
+                self._iter_items(limit=10000), device_name, role=AS.kAXStaticTextRole, visible=True
+            ):
+                return self._center(match)
+            time.sleep(0.5)
         raise QobuzAutomationError(
             f"Qobuzの出力一覧に{device_name}が見つかりません"
         )
