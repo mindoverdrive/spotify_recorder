@@ -31,8 +31,14 @@ PROPERTY_DEVICES = _fourcc("dev#")
 PROPERTY_NAME = _fourcc("lnam")
 PROPERTY_UID = _fourcc("uid ")
 PROPERTY_NOMINAL_RATE = _fourcc("nsrt")
+PROPERTY_ACTUAL_RATE = _fourcc("asrt")
 PROPERTY_AVAILABLE_NOMINAL_RATES = _fourcc("nsr#")
 PROPERTY_TRANSPORT = _fourcc("tran")
+PROPERTY_DEVICE_RUNNING = _fourcc("gone")
+PROPERTY_HOG_MODE = _fourcc("oink")
+PROPERTY_DEFAULT_INPUT = _fourcc("dIn ")
+PROPERTY_DEFAULT_OUTPUT = _fourcc("dOut")
+PROPERTY_DEFAULT_SYSTEM_OUTPUT = _fourcc("sOut")
 TRANSPORT_AGGREGATE = _fourcc("grup")
 
 
@@ -147,6 +153,30 @@ def _property_scalar(coreaudio, object_id, selector, ctype, scope=GLOBAL_SCOPE):
     return ctype.from_buffer_copy(raw).value
 
 
+def _set_property_scalar(object_id, selector, value, ctype, scope=GLOBAL_SCOPE):
+    coreaudio, _ = _libraries()
+    address = _address(selector, scope)
+    settable = ctypes.c_bool(False)
+    status = coreaudio.AudioObjectIsPropertySettable(
+        int(object_id), ctypes.byref(address), ctypes.byref(settable)
+    )
+    if status != 0:
+        raise RuntimeError(f"CoreAudioプロパティ確認に失敗しました: OSStatus {status}")
+    if not settable.value:
+        raise RuntimeError("CoreAudioプロパティは変更できません")
+    payload = ctype(value)
+    status = coreaudio.AudioObjectSetPropertyData(
+        int(object_id),
+        ctypes.byref(address),
+        0,
+        None,
+        ctypes.sizeof(payload),
+        ctypes.byref(payload),
+    )
+    if status != 0:
+        raise RuntimeError(f"CoreAudioプロパティ変更に失敗しました: OSStatus {status}")
+
+
 def _property_cfstring(coreaudio, corefoundation, object_id, selector):
     pointer = _property_scalar(coreaudio, object_id, selector, ctypes.c_void_p)
     if not pointer:
@@ -220,6 +250,99 @@ def resolve_coreaudio_device(device_name, sounddevice_devices=None):
         reason = "見つかりません" if not matches else "同名デバイスが複数あります"
         raise RuntimeError(f"CoreAudioデバイスを一意に特定できません: {name} ({reason})")
     return matches[0]
+
+
+def coreaudio_device_runtime_state(device_id):
+    coreaudio, _ = _libraries()
+    nominal = _property_scalar(
+        coreaudio, int(device_id), PROPERTY_NOMINAL_RATE, ctypes.c_double
+    )
+    actual = _property_scalar(
+        coreaudio, int(device_id), PROPERTY_ACTUAL_RATE, ctypes.c_double
+    )
+    running = _property_scalar(
+        coreaudio, int(device_id), PROPERTY_DEVICE_RUNNING, ctypes.c_uint32
+    )
+    hog_pid = _property_scalar(
+        coreaudio, int(device_id), PROPERTY_HOG_MODE, ctypes.c_int32
+    )
+    return {
+        "device_id": int(device_id),
+        "nominal_sample_rate": None if nominal is None else float(nominal),
+        "actual_sample_rate": None if actual is None else float(actual),
+        "is_running": None if running is None else bool(running),
+        "hog_pid": None if hog_pid is None or int(hog_pid) < 0 else int(hog_pid),
+    }
+
+
+def default_audio_device_ids():
+    coreaudio, _ = _libraries()
+    return {
+        "input": _property_scalar(
+            coreaudio, SYSTEM_OBJECT, PROPERTY_DEFAULT_INPUT, ctypes.c_uint32
+        ),
+        "output": _property_scalar(
+            coreaudio, SYSTEM_OBJECT, PROPERTY_DEFAULT_OUTPUT, ctypes.c_uint32
+        ),
+        "system_output": _property_scalar(
+            coreaudio,
+            SYSTEM_OBJECT,
+            PROPERTY_DEFAULT_SYSTEM_OUTPUT,
+            ctypes.c_uint32,
+        ),
+    }
+
+
+def set_default_audio_device(kind, device_id):
+    selectors = {
+        "input": PROPERTY_DEFAULT_INPUT,
+        "output": PROPERTY_DEFAULT_OUTPUT,
+        "system_output": PROPERTY_DEFAULT_SYSTEM_OUTPUT,
+    }
+    if kind not in selectors:
+        raise ValueError(f"不明なCoreAudio既定デバイス種別です: {kind}")
+    _set_property_scalar(
+        SYSTEM_OBJECT,
+        selectors[kind],
+        int(device_id),
+        ctypes.c_uint32,
+    )
+
+
+def set_nominal_sample_rate(device_id, sample_rate):
+    _set_property_scalar(
+        int(device_id),
+        PROPERTY_NOMINAL_RATE,
+        float(sample_rate),
+        ctypes.c_double,
+    )
+
+
+def capture_coreaudio_state(device_id):
+    return {
+        "defaults": default_audio_device_ids(),
+        "capture_device": coreaudio_device_runtime_state(device_id),
+    }
+
+
+def restore_coreaudio_state(state):
+    errors = []
+    capture = (state or {}).get("capture_device") or {}
+    device_id = capture.get("device_id")
+    nominal = capture.get("nominal_sample_rate")
+    if device_id is not None and nominal:
+        try:
+            set_nominal_sample_rate(device_id, nominal)
+        except Exception as exc:
+            errors.append(f"入力レート復元失敗: {exc}")
+    for kind, device in ((state or {}).get("defaults") or {}).items():
+        if device is None:
+            continue
+        try:
+            set_default_audio_device(kind, device)
+        except Exception as exc:
+            errors.append(f"既定{kind}復元失敗: {exc}")
+    return {"restored": not errors, "errors": errors}
 
 
 def available_nominal_sample_rates(device_id):

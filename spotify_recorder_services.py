@@ -193,7 +193,18 @@ def get_spotify_info_extended():
     return {"status": "NOT_LINKED", "error": err_msg}
 
 def download_url_bytes(url):
-    if not url or not url.startswith("http"):
+    if not url:
+        return None
+    local_path = os.path.abspath(os.path.expanduser(str(url)))
+    if os.path.isfile(local_path):
+        try:
+            if os.path.getsize(local_path) > 25 * 1024 * 1024:
+                return None
+            with open(local_path, "rb") as handle:
+                return handle.read()
+        except OSError:
+            return None
+    if not str(url).startswith("http"):
         return None
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -626,6 +637,17 @@ def _tag_flac(
     audio["TITLE"] = title
     audio["ARTIST"] = artist
     audio["ALBUM"] = album
+    if track_info.get("playlist_id") is not None:
+        audio["QOBUZ_PLAYLIST_ID"] = str(track_info["playlist_id"])
+        audio["QOBUZ_PLAYLIST_NAME"] = str(
+            track_info.get("playlist_name") or album
+        )
+    if track_info.get("original_index") is not None:
+        original_position = int(track_info["original_index"]) + 1
+        audio["QOBUZ_PLAYLIST_POSITION"] = str(original_position)
+        audio["TRACKNUMBER"] = str(original_position)
+    if track_info.get("track_id") is not None:
+        audio["QOBUZ_TRACK_ID"] = str(track_info["track_id"])
     for field in (
         "albumartist",
         "date",
@@ -1798,6 +1820,7 @@ def process_and_save_candidates(candidates, options, log_callback, on_finish):
 
     saved = 0
     failed = 0
+    items = []
     try:
         for cand in candidates:
             if not cand.get("selected", False):
@@ -1871,8 +1894,9 @@ def process_and_save_candidates(candidates, options, log_callback, on_finish):
                 )
                 for warning in analysis["warnings"]:
                     log_callback(f"品質警告: {os.path.basename(final_path)} / {warning}")
+                export_result = None
                 if options.get("auto_flac_export", True):
-                    auto_export_variants(
+                    export_result = auto_export_variants(
                         final_path,
                         track_info=track,
                         artwork_bytes=artwork_bytes,
@@ -1881,6 +1905,15 @@ def process_and_save_candidates(candidates, options, log_callback, on_finish):
                         catalog_path=catalog_path,
                         log_callback=log_callback,
                     )
+                items.append(
+                    {
+                        "track": dict(track),
+                        "wav_path": final_path,
+                        "analysis": analysis,
+                        "capture_audit": file_audit,
+                        "exports": export_result,
+                    }
+                )
                 saved += 1
             except Exception as exc:
                 failed += 1
@@ -1892,3 +1925,4 @@ def process_and_save_candidates(candidates, options, log_callback, on_finish):
         log_callback(f"処理完了: {saved} 件保存 / {failed} 件失敗")
         if on_finish:
             on_finish()
+    return {"saved": saved, "failed": failed, "items": items}

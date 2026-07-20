@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime
 from tkinter import TclError, filedialog
 
@@ -25,6 +26,9 @@ from coreaudio_devices import (
     resolve_coreaudio_device,
     sync_nominal_sample_rate,
 )
+from qobuz_automation import QobuzAutomation
+from qobuz_playlist import list_qobuz_playlists, scan_qobuz_playlist
+from qobuz_playlist_job import QobuzPlaylistJob
 from library_converter import (
     LibraryConversionQueue,
     default_library_destination,
@@ -36,8 +40,10 @@ from recording_catalog import (
     list_audio_exports,
     list_library_assets,
     list_library_jobs,
+    list_qobuz_playlist_jobs,
     list_recordings,
 )
+from settings_transaction import CaptureSettingsTransaction, run_restore_watchdog
 from spotify_recorder_services import (
     MODE_PRESETS,
     MODE_ALBUM,
@@ -109,11 +115,23 @@ class HiResRecorderApp(ctk.CTk):
             self.catalog_path,
             event_callback=self.on_library_conversion_event,
         )
+        self.qobuz_automation = QobuzAutomation()
+        self.qobuz_playlists = {}
+        self.qobuz_playlist_scan = None
+        self.qobuz_excluded_track_ids = set()
+        self.qobuz_job = None
+        self.qobuz_settings_transaction = None
+        self.qobuz_batch_track = None
+        self.qobuz_batch_state = "idle"
+        self.qobuz_batch_capture = False
+        self.qobuz_batch_wait_deadline = None
+        self.qobuz_watchdog_process = None
+        self.qobuz_previous_auto_stop = None
 
         self.log_queue = queue.Queue()
         self.ui_queue = queue.Queue()
         self.save_dir = ctk.StringVar(value=os.path.expanduser("~/Music/Hi-Res Recorder"))
-        self.provider = ctk.StringVar(value=PROVIDER_SPOTIFY)
+        self.provider = ctk.StringVar(value=PROVIDER_QOBUZ)
         self.maximum_recording_minutes = ctk.IntVar(value=120)
         self.record_ch_start = ctk.IntVar(value=5)
         self.silence_threshold_db = ctk.DoubleVar(value=-60.0)
@@ -130,6 +148,7 @@ class HiResRecorderApp(ctk.CTk):
             value=default_library_destination()
         )
         self.current_library_job_id = None
+        self.qobuz_playlist_choice = ctk.StringVar(value="プレイリストを読み込み中")
 
         self.audio_devices = sd.query_devices()
         self.input_devices = [
@@ -153,9 +172,16 @@ class HiResRecorderApp(ctk.CTk):
             self.after(300, self.show_recovery_prompt)
         self.after(CHECK_INTERVAL_MS, self.poll_source)
         self.after(50, self.process_queues)
+        self.after(200, self.refresh_qobuz_playlists)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def pick_default_input(self):
+        for index, device in self.input_devices:
+            name = device["name"].lower()
+            if "qobuz" in name and any(
+                token in name for token in ("loopback", "blackhole")
+            ):
+                return index
         for needle in ("loopback", "blackhole"):
             for index, device in self.input_devices:
                 if needle in device["name"].lower():
@@ -228,63 +254,127 @@ class HiResRecorderApp(ctk.CTk):
         )
         self.rate_sync_label.pack(pady=(0, 8), padx=10)
 
-        meter_frame = ctk.CTkFrame(root, fg_color="transparent")
-        meter_frame.pack(fill="x", padx=18, pady=2)
-        ctk.CTkLabel(meter_frame, text="Input").pack(side="left")
-        self.level_meter = ctk.CTkProgressBar(meter_frame, height=12, progress_color="#1DB954")
+        self.qobuz_job_frame = ctk.CTkFrame(root, fg_color="#161a1f", corner_radius=8)
+        qobuz_header = ctk.CTkFrame(self.qobuz_job_frame, fg_color="transparent")
+        qobuz_header.pack(fill="x", padx=12, pady=(10, 6))
+        ctk.CTkLabel(
+            qobuz_header,
+            text="Qobuz Offline プレイリスト録音",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).pack(side="left")
+        self.qobuz_reload_btn = ctk.CTkButton(
+            qobuz_header,
+            text="更新",
+            width=70,
+            command=self.refresh_qobuz_playlists,
+            fg_color="#30363d",
+            hover_color="#484f58",
+        )
+        self.qobuz_reload_btn.pack(side="right")
+        self.qobuz_playlist_menu = ctk.CTkOptionMenu(
+            self.qobuz_job_frame,
+            values=["プレイリストを読み込み中"],
+            variable=self.qobuz_playlist_choice,
+            command=self.on_qobuz_playlist_selected,
+        )
+        self.qobuz_playlist_menu.pack(fill="x", padx=12, pady=4)
+        self.qobuz_playlist_summary = ctk.CTkLabel(
+            self.qobuz_job_frame,
+            text="Qobuzでプレイリストを完全ダウンロードしてから事前検査します",
+            text_color="#b7bec8",
+            anchor="w",
+            justify="left",
+            wraplength=720,
+        )
+        self.qobuz_playlist_summary.pack(fill="x", padx=12, pady=5)
+        qobuz_actions = ctk.CTkFrame(self.qobuz_job_frame, fg_color="transparent")
+        qobuz_actions.pack(fill="x", padx=12, pady=(4, 10))
+        self.qobuz_scan_btn = ctk.CTkButton(
+            qobuz_actions,
+            text="事前検査",
+            command=self.scan_selected_qobuz_playlist,
+            fg_color="#30363d",
+            hover_color="#484f58",
+        )
+        self.qobuz_scan_btn.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.qobuz_job_start_btn = ctk.CTkButton(
+            qobuz_actions,
+            text="プレイリスト録音開始",
+            command=self.start_qobuz_playlist_job,
+            state="disabled",
+            fg_color="#1DB954",
+            hover_color="#1ed760",
+            text_color="#06170c",
+        )
+        self.qobuz_job_start_btn.pack(side="left", fill="x", expand=True, padx=5)
+        self.qobuz_job_cancel_btn = ctk.CTkButton(
+            qobuz_actions,
+            text="中止",
+            command=self.cancel_qobuz_playlist_job,
+            state="disabled",
+            fg_color="#e91429",
+            hover_color="#ff3348",
+            width=80,
+        )
+        self.qobuz_job_cancel_btn.pack(side="left", padx=(5, 0))
+
+        self.meter_frame = ctk.CTkFrame(root, fg_color="transparent")
+        self.meter_frame.pack(fill="x", padx=18, pady=2)
+        ctk.CTkLabel(self.meter_frame, text="Input").pack(side="left")
+        self.level_meter = ctk.CTkProgressBar(self.meter_frame, height=12, progress_color="#1DB954")
         self.level_meter.pack(side="left", fill="x", expand=True, padx=10)
         self.level_meter.set(0)
 
         # Recording mode and fixed quality profile
-        controls_frame = ctk.CTkFrame(root, fg_color="transparent")
-        controls_frame.pack(fill="x", padx=18, pady=2)
+        self.legacy_controls_frame = ctk.CTkFrame(root, fg_color="transparent")
+        self.legacy_controls_frame.pack(fill="x", padx=18, pady=2)
         
-        ctk.CTkLabel(controls_frame, text="モード:").pack(side="left")
-        self.mode_menu = ctk.CTkSegmentedButton(controls_frame, values=MODE_PRESETS, variable=self.record_mode)
+        ctk.CTkLabel(self.legacy_controls_frame, text="モード:").pack(side="left")
+        self.mode_menu = ctk.CTkSegmentedButton(self.legacy_controls_frame, values=MODE_PRESETS, variable=self.record_mode)
         self.mode_menu.pack(side="left", padx=10)
 
         self.quality_label = ctk.CTkLabel(
-            controls_frame,
+            self.legacy_controls_frame,
             text="Archive: native-rate 24-bit / DJ: 24-bit 48kHz / conditional dither",
             fg_color="#252b33",
             corner_radius=5,
         )
         self.quality_label.pack(side="left", padx=(20, 0))
 
-        switches = ctk.CTkFrame(root, fg_color="transparent")
-        switches.pack(fill="x", padx=18, pady=4)
+        self.legacy_switches = ctk.CTkFrame(root, fg_color="transparent")
+        self.legacy_switches.pack(fill="x", padx=18, pady=4)
         self.automation_provider_label = ctk.CTkLabel(
-            switches,
+            self.legacy_switches,
             text="監視対象: Spotify Offline",
             text_color="#63f08f",
         )
         self.automation_provider_label.pack(anchor="w", pady=(0, 2))
         self.standby_switch = ctk.CTkSwitch(
-            switches,
+            self.legacy_switches,
             text="Standby (Spotify / Qobuz): 選択中サービスの再生で自動開始",
             progress_color="#1DB954",
             command=self.on_standby_toggle,
         )
         self.standby_switch.pack(anchor="w", pady=2)
         self.auto_stop_switch = ctk.CTkSwitch(
-            switches,
+            self.legacy_switches,
             text="自動停止 (Spotify / Qobuz): 選択中サービスの停止・一時停止を検知",
             variable=self.auto_stop_on_idle,
             progress_color="#1DB954",
         )
         self.auto_stop_switch.pack(anchor="w", pady=2)
         self.discard_tail_switch = ctk.CTkSwitch(
-            switches,
+            self.legacy_switches,
             text="停止時の短い最終断片を保存しない",
             variable=self.discard_tail,
             progress_color="#1DB954",
         )
         self.discard_tail_switch.pack(anchor="w", pady=2)
 
-        buttons = ctk.CTkFrame(root, fg_color="transparent")
-        buttons.pack(fill="x", padx=18, pady=6)
+        self.legacy_buttons = ctk.CTkFrame(root, fg_color="transparent")
+        self.legacy_buttons.pack(fill="x", padx=18, pady=6)
         self.start_btn = ctk.CTkButton(
-            buttons,
+            self.legacy_buttons,
             text="Start Recording",
             height=40,
             fg_color="#1DB954",
@@ -295,7 +385,7 @@ class HiResRecorderApp(ctk.CTk):
         )
         self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.stop_btn = ctk.CTkButton(
-            buttons,
+            self.legacy_buttons,
             text="Stop & Review",
             height=40,
             fg_color="#e91429",
@@ -305,7 +395,7 @@ class HiResRecorderApp(ctk.CTk):
         )
         self.stop_btn.pack(side="left", fill="x", expand=True, padx=6)
         self.abort_btn = ctk.CTkButton(
-            buttons,
+            self.legacy_buttons,
             text="Abort",
             height=40,
             fg_color="#414852",
@@ -409,9 +499,18 @@ class HiResRecorderApp(ctk.CTk):
         self.diag_btn.configure(state=locked_state)
         for entry in self.setting_entries:
             entry.configure(state=locked_state)
+        if hasattr(self, "qobuz_scan_btn"):
+            self.qobuz_scan_btn.configure(state=locked_state)
+            self.qobuz_reload_btn.configure(state=locked_state)
 
     def log_message(self, message):
         self.log_queue.put(message)
+
+    def dispatch_ui(self, callback, delay_ms=0):
+        if delay_ms:
+            self.ui_queue.put(lambda: self.after(int(delay_ms), callback))
+        else:
+            self.ui_queue.put(callback)
 
     def process_queues(self):
         while not self.ui_queue.empty():
@@ -587,10 +686,10 @@ class HiResRecorderApp(ctk.CTk):
                 candidates = prepare_track_candidates(
                     audio, history, options, None, self.log_message
                 )
-                self.after(0, lambda: self.show_review_ui(candidates, options))
+                self.dispatch_ui(lambda: self.show_review_ui(candidates, options))
             except Exception as exc:
                 self.log_message(f"録音スプール復旧エラー: {exc}")
-                self.after(0, self.on_processing_finished)
+                self.dispatch_ui(self.on_processing_finished)
 
         threading.Thread(target=evaluate, daemon=True).start()
 
@@ -601,26 +700,250 @@ class HiResRecorderApp(ctk.CTk):
         self.update_sample_rate()
         self.log_message(f"入力デバイス: {self.device_in_id} / {self.sample_rate}Hz")
         self.refresh_source_quality_status()
-        snapshot = self.current_source_info or {"state": "stopped"}
-        self.consider_idle_sample_rate_sync(snapshot)
+        if self.provider.get() == PROVIDER_SPOTIFY:
+            snapshot = self.current_source_info or {"state": "stopped"}
+            self.consider_idle_sample_rate_sync(snapshot)
+        else:
+            self._set_rate_sync_status("プレイリストジョブ開始時に曲別同期", "#63f08f")
 
     def current_adapter(self):
         return self.provider_adapters[self.provider.get()]
 
+    def refresh_qobuz_playlists(self):
+        if self.qobuz_job is not None:
+            return
+        self.qobuz_reload_btn.configure(state="disabled")
+        self.qobuz_playlist_summary.configure(
+            text="QobuzローカルDBからプレイリストを読み込み中...",
+            text_color="#b7bec8",
+        )
+
+        def worker():
+            try:
+                playlists = list_qobuz_playlists()
+                error = None
+            except Exception as exc:
+                playlists = []
+                error = str(exc)
+
+            def finish():
+                self.qobuz_reload_btn.configure(state="normal")
+                if error:
+                    self.qobuz_playlists = {}
+                    self.qobuz_playlist_menu.configure(values=["読込失敗"])
+                    self.qobuz_playlist_choice.set("読込失敗")
+                    self.qobuz_playlist_summary.configure(
+                        text=f"プレイリスト読込失敗: {error}", text_color="#ff5964"
+                    )
+                    self.log_message(f"Qobuzプレイリスト読込失敗: {error}")
+                    return
+                labels = [
+                    f"{item.name} ({item.track_count}曲) [{item.playlist_id}]"
+                    for item in playlists
+                ]
+                self.qobuz_playlists = {
+                    label: item for label, item in zip(labels, playlists)
+                }
+                values = labels or ["プレイリストなし"]
+                self.qobuz_playlist_menu.configure(values=values)
+                current = self.qobuz_playlist_choice.get()
+                if current not in self.qobuz_playlists:
+                    self.qobuz_playlist_choice.set(values[0])
+                self.qobuz_playlist_scan = None
+                self.qobuz_job_start_btn.configure(state="disabled")
+                self.qobuz_playlist_summary.configure(
+                    text=(
+                        f"{len(playlists)}件を検出。対象を選び、事前検査してください。"
+                        if playlists
+                        else "ローカルQobuz DBにプレイリストがありません"
+                    ),
+                    text_color="#b7bec8" if playlists else "#f0b429",
+                )
+
+            self.dispatch_ui(finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_qobuz_playlist_selected(self, _value):
+        if self.qobuz_job is not None:
+            return
+        self.qobuz_playlist_scan = None
+        self.qobuz_excluded_track_ids = set()
+        self.qobuz_job_start_btn.configure(state="disabled")
+        self.qobuz_playlist_summary.configure(
+            text="選択したプレイリストは未検査です", text_color="#f0b429"
+        )
+
+    def scan_selected_qobuz_playlist(self):
+        summary = self.qobuz_playlists.get(self.qobuz_playlist_choice.get())
+        if summary is None or self.qobuz_job is not None:
+            return
+        self.qobuz_scan_btn.configure(state="disabled")
+        self.qobuz_job_start_btn.configure(state="disabled")
+        self.qobuz_playlist_summary.configure(
+            text="完全ダウンロード、形式、レート、bit深度、2chを検査中...",
+            text_color="#58a6ff",
+        )
+
+        def worker():
+            try:
+                scan = scan_qobuz_playlist(
+                    summary.playlist_id,
+                    excluded_track_ids=self.qobuz_excluded_track_ids,
+                )
+                error = None
+            except Exception as exc:
+                scan = None
+                error = str(exc)
+
+            def finish():
+                self.qobuz_scan_btn.configure(state="normal")
+                if error:
+                    self.qobuz_playlist_scan = None
+                    self.qobuz_playlist_summary.configure(
+                        text=f"事前検査失敗: {error}", text_color="#ff5964"
+                    )
+                    self.log_message(f"Qobuzプレイリスト事前検査失敗: {error}")
+                    return
+                self.qobuz_playlist_scan = scan
+                rates = " / ".join(
+                    f"{rate}Hz: {count}曲" for rate, count in scan.rate_groups.items()
+                ) or "対象曲なし"
+                self.qobuz_playlist_summary.configure(
+                    text=(
+                        f"全{len(scan.tracks)}曲 / 録音{len(scan.eligible_tracks)}曲 / "
+                        f"除外{len(scan.excluded_tracks)}曲 / 要対応{len(scan.blocking_tracks)}曲\n"
+                        f"実行グループ: {rates}"
+                    ),
+                    text_color="#63f08f" if scan.can_start else "#ff5964",
+                )
+                self.qobuz_job_start_btn.configure(
+                    state="normal" if scan.can_start else "disabled"
+                )
+                self.log_message(
+                    f"Qobuzプレイリスト検査: {scan.name} / "
+                    f"録音{len(scan.eligible_tracks)} / 要対応{len(scan.blocking_tracks)} / "
+                    f"除外{len(scan.excluded_tracks)}"
+                )
+                if scan.blocking_tracks:
+                    self.show_qobuz_exclusion_review(scan)
+
+            self.dispatch_ui(finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_qobuz_exclusion_review(self, scan):
+        window = ctk.CTkToplevel(self)
+        window.title("Qobuzプレイリスト要対応曲")
+        window.geometry("760x520")
+        window.transient(self)
+        window.grab_set()
+        ctk.CTkLabel(
+            window,
+            text="未完了曲があるため録音を開始できません",
+            font=ctk.CTkFont(size=17, weight="bold"),
+            text_color="#ff5964",
+        ).pack(pady=(14, 4))
+        ctk.CTkLabel(
+            window,
+            text="Qobuzで完全ダウンロード後に再検査するか、今回録音しない曲だけ明示的に除外してください。",
+            text_color="#b7bec8",
+            wraplength=700,
+        ).pack(padx=18, pady=(0, 8))
+        scroll = ctk.CTkScrollableFrame(window)
+        scroll.pack(fill="both", expand=True, padx=14, pady=8)
+        selections = []
+        for track in scan.blocking_tracks:
+            variable = ctk.BooleanVar(value=False)
+            selections.append((track, variable))
+            ctk.CTkCheckBox(
+                scroll,
+                variable=variable,
+                text=(
+                    f"{track.original_index + 1}. {track.artist} - {track.name}\n"
+                    + " / ".join(track.issues)
+                ),
+            ).pack(fill="x", anchor="w", padx=8, pady=6)
+        actions = ctk.CTkFrame(window, fg_color="transparent")
+        actions.pack(fill="x", padx=14, pady=(0, 14))
+
+        def exclude_selected():
+            selected = {track.track_id for track, variable in selections if variable.get()}
+            if not selected:
+                self.log_message("除外する曲が選択されていません。")
+                return
+            self.qobuz_excluded_track_ids.update(selected)
+            window.destroy()
+            self.scan_selected_qobuz_playlist()
+
+        ctk.CTkButton(
+            actions,
+            text="選択曲を今回だけ除外",
+            command=exclude_selected,
+            fg_color="#e91429",
+            hover_color="#ff3348",
+        ).pack(side="right", padx=5)
+        ctk.CTkButton(
+            actions,
+            text="閉じてQobuzでダウンロード",
+            command=window.destroy,
+            fg_color="#30363d",
+            hover_color="#484f58",
+        ).pack(side="right", padx=5)
+
     def on_provider_change(self, value, refresh=True):
         self.automation_provider_label.configure(text=f"監視対象: {value} Offline")
+        if value == PROVIDER_QOBUZ:
+            self.record_ch_start.set(1)
+            self.legacy_controls_frame.pack_forget()
+            self.legacy_switches.pack_forget()
+            self.legacy_buttons.pack_forget()
+            if not self.qobuz_job_frame.winfo_manager():
+                self.qobuz_job_frame.pack(
+                    fill="x", padx=18, pady=6, before=self.meter_frame
+                )
+        else:
+            self.qobuz_job_frame.pack_forget()
+            if not self.legacy_controls_frame.winfo_manager():
+                self.legacy_controls_frame.pack(
+                    fill="x", padx=18, pady=2, after=self.meter_frame
+                )
+                self.legacy_switches.pack(
+                    fill="x", padx=18, pady=4, after=self.legacy_controls_frame
+                )
+                self.legacy_buttons.pack(
+                    fill="x", padx=18, pady=6, after=self.legacy_switches
+                )
         self.current_source_info = None
         self.source_idle_since = None
         self.last_track_key = None
+        self._set_rate_sync_status(f"{value}ソースを確認中")
         if self.is_standby:
             with self.audio_lock:
                 self.pre_chunks = []
                 self.pre_samples = 0
             self.log_message(f"Standby監視対象を{value} Offlineへ変更しました。")
         if refresh:
-            self.refresh_source_quality_status(log_result=True)
-        snapshot = self.current_source_info or {"state": "stopped"}
-        self.after(0, lambda: self.consider_idle_sample_rate_sync(snapshot))
+            settings = self.refresh_source_quality_status(log_result=True)
+            snapshot = settings.get("snapshot") if isinstance(settings, dict) else None
+            if not snapshot:
+                snapshot = self.current_adapter().snapshot()
+            self.current_source_info = snapshot
+            if value == PROVIDER_SPOTIFY:
+                self.after(
+                    0,
+                    lambda current=dict(snapshot): self.request_sample_rate_sync(current),
+                )
+            else:
+                self._set_rate_sync_status("プレイリストジョブ開始時に曲別同期", "#63f08f")
+        else:
+            if value == PROVIDER_SPOTIFY:
+                self.after(
+                    0,
+                    lambda: self.consider_idle_sample_rate_sync({"state": "stopped"}),
+                )
+            else:
+                self._set_rate_sync_status("プレイリストジョブ開始時に曲別同期", "#63f08f")
 
     def current_device_profile(self):
         if self.device_in_id is None:
@@ -767,7 +1090,7 @@ class HiResRecorderApp(ctk.CTk):
                 if pending and result.verified:
                     self.start_rec()
 
-            self.after(0, finish)
+            self.dispatch_ui(finish)
 
         threading.Thread(target=worker, daemon=True).start()
         return False
@@ -835,6 +1158,473 @@ class HiResRecorderApp(ctk.CTk):
             evidence["rate_sync"] = dict(self.last_rate_sync)
         return result
 
+    def validate_qobuz_batch_device(self, profile):
+        warnings = []
+        name = str(profile.get("name") or "")
+        normalized = name.lower().replace(" ", "")
+        if profile.get("is_aggregate"):
+            warnings.append("Aggregate/Multi-Output Deviceは使用できません")
+        if not any(token in normalized for token in ("loopback", "blackhole")):
+            warnings.append("LoopbackまたはBlackHoleの仮想デバイスではありません")
+        if int(profile.get("max_input_channels") or 0) != 2:
+            warnings.append(
+                "Qobuz一括録音は専用2ch仮想デバイスのみ対応します。共有16ch構成は使用できません"
+            )
+        if "loopback" in normalized and "qobuz" not in normalized:
+            warnings.append(
+                "Loopbackでは名前にQobuzを含む専用2ch Pass-Thruデバイスを選択してください"
+            )
+        if not profile.get("uid"):
+            warnings.append("CoreAudio Device UIDを取得できません")
+        return warnings
+
+    def _set_qobuz_job_ui(self, active, status=None, color="#58a6ff"):
+        self.provider_menu.configure(state="disabled" if active else "normal")
+        self.in_combo.configure(state="disabled" if active else "normal")
+        self.browse_btn.configure(state="disabled" if active else "normal")
+        self.qobuz_reload_btn.configure(state="disabled" if active else "normal")
+        self.qobuz_scan_btn.configure(state="disabled" if active else "normal")
+        self.qobuz_playlist_menu.configure(state="disabled" if active else "normal")
+        self.qobuz_job_start_btn.configure(
+            state="disabled"
+            if active or not (self.qobuz_playlist_scan and self.qobuz_playlist_scan.can_start)
+            else "normal"
+        )
+        self.qobuz_job_cancel_btn.configure(state="normal" if active else "disabled")
+        if status:
+            self.qobuz_playlist_summary.configure(text=status, text_color=color)
+
+    def start_qobuz_playlist_job(self):
+        scan = self.qobuz_playlist_scan
+        if self.provider.get() != PROVIDER_QOBUZ or self.qobuz_job is not None:
+            return
+        if scan is None or not scan.can_start:
+            self.log_message("Qobuzプレイリストの事前検査が完了していません。")
+            return
+        try:
+            profile = self.current_device_profile()
+        except Exception as exc:
+            self.log_message(f"Qobuzジョブ開始拒否: 入力デバイス確認失敗: {exc}")
+            return
+        warnings = self.validate_qobuz_batch_device(profile)
+        if warnings:
+            for warning in warnings:
+                self.log_message(f"Qobuzジョブ開始拒否: {warning}")
+            self.qobuz_playlist_summary.configure(
+                text="開始拒否: " + " / ".join(warnings), text_color="#ff5964"
+            )
+            return
+        self.record_ch_start.set(1)
+        self.qobuz_previous_auto_stop = (
+            bool(self.auto_stop_on_idle.get()),
+            float(self.auto_stop_grace_sec.get()),
+        )
+        self.auto_stop_on_idle.set(True)
+        self.auto_stop_grace_sec.set(0.75)
+        job = QobuzPlaylistJob(scan, self.catalog_path, self.save_dir.get())
+        transaction = CaptureSettingsTransaction(
+            job.job_id,
+            profile["device_id"],
+            qobuz_automation=self.qobuz_automation,
+        )
+        self.qobuz_job = job
+        self.qobuz_settings_transaction = transaction
+        self.qobuz_batch_state = "preparing"
+        job.create(settings_journal_path=transaction.journal_path)
+        self._set_qobuz_job_ui(
+            True,
+            "設定を保存し、Qobuz出力とCoreAudio入力を専用デバイスへ準備中...",
+        )
+
+        def worker():
+            try:
+                journal = transaction.begin(qobuz_output_device_name=profile["name"])
+                job.start(settings_journal_path=journal)
+                self._spawn_settings_watchdog(journal)
+                error = None
+            except Exception as exc:
+                error = str(exc)
+                job.fail(error)
+
+            def finish():
+                if error:
+                    self.log_message(f"Qobuzジョブ準備失敗: {error}")
+                    self._finish_qobuz_job(cancelled=True, error=error)
+                    return
+                self.log_message(
+                    f"Qobuzプレイリスト録音開始: {scan.name} / "
+                    f"{len(scan.eligible_tracks)}曲 / レート別実行"
+                )
+                self._prepare_next_qobuz_track()
+
+            self.dispatch_ui(finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _spawn_settings_watchdog(self, journal_path):
+        if getattr(sys, "frozen", False):
+            command = [
+                sys.executable,
+                "--restore-watchdog",
+                str(os.getpid()),
+                journal_path,
+            ]
+        else:
+            command = [
+                sys.executable,
+                os.path.abspath(__file__),
+                "--restore-watchdog",
+                str(os.getpid()),
+                journal_path,
+            ]
+        try:
+            self.qobuz_watchdog_process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            self.log_message(f"設定復元watchdog起動警告: {exc}")
+
+    def _prepare_next_qobuz_track(self):
+        job = self.qobuz_job
+        if job is None or job.cancelled:
+            self._finish_qobuz_job(cancelled=True)
+            return
+        if job.current_track is None:
+            self._finish_qobuz_job(cancelled=False)
+            return
+        track = job.begin_attempt()
+        self.qobuz_batch_track = track
+        self.qobuz_batch_state = "syncing"
+        self.qobuz_batch_capture = False
+        self.is_standby = False
+        self.standby_switch.deselect()
+        self.stop_audio_stream()
+        self._set_qobuz_job_ui(
+            True,
+            f"{job.cursor + 1}/{len(job.execution)}: {track.artist} - {track.name}\n"
+            f"入力レートを{track.source_sample_rate}Hzへ同期中 "
+            f"(試行{job.attempts[track.original_index]}/{job.max_retries + 1})",
+        )
+
+        def worker():
+            try:
+                self.qobuz_automation.pause()
+                profile = self.current_device_profile()
+                result = sync_nominal_sample_rate(
+                    profile, int(track.source_sample_rate)
+                )
+                if not result.verified:
+                    raise RuntimeError(result.reason)
+                sd.check_input_settings(
+                    device=self.device_in_id,
+                    channels=2,
+                    dtype="float32",
+                    samplerate=int(track.source_sample_rate),
+                )
+                error = None
+            except Exception as exc:
+                result = None
+                error = str(exc)
+
+            def finish():
+                if error:
+                    self._fail_qobuz_attempt(f"入力レート同期失敗: {error}")
+                    return
+                self.last_rate_sync = result.to_dict()
+                self.sample_rate = int(result.rate_after)
+                self._set_rate_sync_status(
+                    f"同期済み {result.device_name} {result.rate_after}Hz", "#63f08f"
+                )
+                self._open_qobuz_batch_track()
+
+            self.dispatch_ui(finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_qobuz_batch_track(self):
+        track = self.qobuz_batch_track
+        if track is None or self.qobuz_job is None:
+            return
+        self.is_standby = True
+        self.standby_switch.select()
+        with self.audio_lock:
+            self.pre_chunks = []
+            self.pre_samples = 0
+        if not self.start_audio_stream():
+            self._fail_qobuz_attempt("録音ストリームを開始できません")
+            return
+        self.qobuz_batch_state = "loading"
+        self.qobuz_batch_wait_deadline = time.monotonic() + 25.0
+        self._set_qobuz_job_ui(
+            True,
+            f"Qobuz Offline曲を曲頭から読み込み中: {track.artist} - {track.name}",
+        )
+
+        def worker():
+            try:
+                self.qobuz_automation.open_track(
+                    track.track_id,
+                    album_id=track.album_id,
+                    track_number=track.track_number,
+                    title=track.name,
+                )
+                self.qobuz_automation.play()
+                error = None
+            except Exception as exc:
+                error = str(exc)
+            if error:
+                self.dispatch_ui(lambda: self._fail_qobuz_attempt(error))
+            else:
+                self.dispatch_ui(self._poll_qobuz_batch_track_ready, delay_ms=250)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _poll_qobuz_batch_track_ready(self):
+        if self.qobuz_job is None or self.qobuz_batch_state not in {"loading", "waiting"}:
+            return
+        self.qobuz_batch_state = "waiting"
+        track = self.qobuz_batch_track
+        snapshot = self.current_adapter().snapshot()
+        observed_id = str(snapshot.get("track_id") or "")
+        if observed_id == track.track_id and source_is_playing(snapshot):
+            try:
+                position = float(snapshot.get("position") or 0.0)
+            except (TypeError, ValueError):
+                position = 0.0
+            if position > 3.0:
+                self._fail_qobuz_attempt(
+                    f"曲頭からの再生を確認できません: 再生位置 {position:.2f}秒"
+                )
+                return
+            try:
+                observed_rate = int(
+                    round(float(self.current_device_profile()["nominal_sample_rate"]))
+                )
+            except Exception as exc:
+                self._fail_qobuz_attempt(f"再生開始後の入力レート確認失敗: {exc}")
+                return
+            if observed_rate != int(track.source_sample_rate):
+                self._fail_qobuz_attempt(
+                    f"Qobuz再生開始後にレートが変化しました: "
+                    f"{track.source_sample_rate}Hz -> {observed_rate}Hz"
+                )
+                return
+            self._start_qobuz_batch_capture(snapshot)
+            return
+        if time.monotonic() >= self.qobuz_batch_wait_deadline:
+            self._fail_qobuz_attempt(
+                f"Qobuz曲ID/再生開始を確認できません: 期待{track.track_id} / "
+                f"検出{observed_id or 'none'}"
+            )
+            return
+        self.dispatch_ui(self._poll_qobuz_batch_track_ready, delay_ms=250)
+
+    def _start_qobuz_batch_capture(self, snapshot):
+        if self.qobuz_job is None or self.qobuz_batch_track is None:
+            return
+        track = self.qobuz_batch_track
+        self.current_source_info = {**snapshot, **track.to_dict(), "state": "playing"}
+        self.qobuz_batch_capture = True
+        self.qobuz_batch_state = "starting"
+        self.start_rec()
+        if not self.is_recording:
+            self.qobuz_batch_capture = False
+            self._fail_qobuz_attempt("Qobuz品質ゲートが録音開始を拒否しました")
+            return
+        self.qobuz_batch_state = "recording"
+        self._set_qobuz_job_ui(
+            True,
+            f"録音中 {self.qobuz_job.cursor + 1}/{len(self.qobuz_job.execution)}: "
+            f"{track.artist} - {track.name}\n"
+            f"{track.source_bit_depth}-bit/{track.source_sample_rate}Hz -> "
+            "Archive native + DJ 24/48",
+            "#e91429",
+        )
+
+    def _fail_qobuz_attempt(self, reason):
+        job = self.qobuz_job
+        if job is None:
+            return
+        self.log_message(f"Qobuz録音試行失敗: {reason}")
+        self.qobuz_batch_capture = False
+        self.is_standby = False
+        self.standby_switch.deselect()
+        self.stop_audio_stream()
+        accepted, stored_reason = job.finish_attempt(
+            {"saved": 0, "failed": 1, "items": [], "error": reason}
+        )
+        del accepted
+        if job.current_track is not None:
+            self.log_message(
+                f"再試行予定: {job.current_track.artist} - {job.current_track.name} / "
+                f"{stored_reason or reason}"
+            )
+        self.dispatch_ui(self._prepare_next_qobuz_track, delay_ms=750)
+
+    def _process_qobuz_batch_capture(self, audio, options):
+        job = self.qobuz_job
+        track = self.qobuz_batch_track
+        if job is None or track is None:
+            self.on_processing_finished()
+            return
+        self.qobuz_batch_state = "processing"
+        self.qobuz_batch_capture = False
+        self._set_qobuz_job_ui(
+            True,
+            f"解析・Archive/DJ変換中: {track.artist} - {track.name}",
+            "#58a6ff",
+        )
+        batch_options = dict(options)
+        batch_options.update(
+            min_keep_sec=0.0,
+            discard_tail=False,
+            discard_tail_under_sec=0.0,
+            record_mode=MODE_MANUAL,
+        )
+        track_info = {**track.to_dict(), "playlist_name": job.scan.name}
+        history = [{**track_info, "start_sample": 0, "key": track.track_id}]
+
+        def worker():
+            try:
+                candidates = prepare_track_candidates(
+                    audio, history, batch_options, None, self.log_message
+                )
+                for candidate in candidates:
+                    candidate["selected"] = False
+                if candidates:
+                    candidate = max(candidates, key=lambda item: item.get("duration", 0.0))
+                    candidate["track"] = track_info
+                    candidate["selected"] = True
+                    result = process_and_save_candidates(
+                        candidates,
+                        batch_options,
+                        self.log_message,
+                        None,
+                    )
+                else:
+                    result = {"saved": 0, "failed": 1, "items": []}
+            except Exception as exc:
+                result = {
+                    "saved": 0,
+                    "failed": 1,
+                    "items": [],
+                    "error": str(exc),
+                }
+                self.log_message(f"Qobuz曲処理失敗: {exc}")
+            self.dispatch_ui(lambda: self._finish_qobuz_track_processing(result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_qobuz_track_processing(self, result):
+        job = self.qobuz_job
+        track = self.qobuz_batch_track
+        if self.pending_spool_audio is not None:
+            self.pending_spool_audio.close(delete=True)
+            self.pending_spool_audio = None
+        self.set_controls_recording(False)
+        self.provider_menu.configure(state="disabled")
+        self.is_standby = False
+        self.standby_switch.deselect()
+        self.stop_audio_stream()
+        if job is None or track is None:
+            return
+        accepted, reason = job.finish_attempt(result)
+        if accepted:
+            self.log_message(f"Qobuz曲完了: {track.artist} - {track.name}")
+        elif job.current_track is track:
+            self.log_message(
+                f"品質不合格のため再試行: {track.artist} - {track.name} / {reason}"
+            )
+        else:
+            self.log_message(
+                f"再試行上限により隔離: {track.artist} - {track.name} / {reason}"
+            )
+        self.qobuz_batch_track = None
+        if job.cancelled:
+            self._finish_qobuz_job(cancelled=True)
+        else:
+            self.dispatch_ui(self._prepare_next_qobuz_track, delay_ms=750)
+
+    def cancel_qobuz_playlist_job(self):
+        job = self.qobuz_job
+        if job is None:
+            return
+        job.cancel()
+        self.log_message("Qobuzプレイリスト録音を中止します。設定を復元します。")
+        if self.is_recording:
+            self.qobuz_batch_capture = False
+            self.is_standby = False
+            self.standby_switch.deselect()
+            self.abort_rec()
+        if self.qobuz_batch_state != "processing":
+            self._finish_qobuz_job(cancelled=True)
+
+    def _finish_qobuz_job(self, cancelled=False, error=None):
+        job = self.qobuz_job
+        transaction = self.qobuz_settings_transaction
+        if job is None:
+            return
+        self.qobuz_batch_state = "restoring"
+        self.qobuz_batch_capture = False
+        self.is_standby = False
+        self.standby_switch.deselect()
+        self.stop_audio_stream()
+        if not cancelled:
+            try:
+                m3u8 = job.finalize()
+                self.log_message(f"QobuzプレイリストM3U8作成: {m3u8}")
+            except Exception as exc:
+                error = str(exc)
+                job.fail(error)
+        self._set_qobuz_job_ui(True, "OS・CoreAudio・Qobuz設定を録音前へ復元中...")
+
+        def worker():
+            if transaction is None:
+                restore_result = {"restored": True, "errors": []}
+            else:
+                try:
+                    restore_result = transaction.restore()
+                except Exception as exc:
+                    restore_result = {"restored": False, "errors": [str(exc)]}
+
+            def finish():
+                for item in restore_result.get("errors") or []:
+                    self.log_message(f"設定復元警告: {item}")
+                failed = len(job.failed)
+                if error:
+                    message = f"Qobuzジョブ失敗: {error}"
+                    color = "#ff5964"
+                elif cancelled:
+                    message = "Qobuzジョブを中止し、設定復元を完了しました"
+                    color = "#f0b429"
+                elif failed:
+                    message = f"Qobuzジョブ完了: {len(job.completed)}曲成功 / {failed}曲隔離"
+                    color = "#f0b429"
+                else:
+                    message = f"Qobuzジョブ完了: {len(job.completed)}曲"
+                    color = "#63f08f"
+                self.log_message(message)
+                self.qobuz_job = None
+                self.qobuz_settings_transaction = None
+                self.qobuz_batch_track = None
+                self.qobuz_batch_state = "idle"
+                if self.qobuz_previous_auto_stop is not None:
+                    enabled, grace = self.qobuz_previous_auto_stop
+                    self.auto_stop_on_idle.set(enabled)
+                    self.auto_stop_grace_sec.set(grace)
+                    self.qobuz_previous_auto_stop = None
+                self.set_controls_recording(False)
+                self._set_qobuz_job_ui(False, message, color)
+                self.status_label.configure(text="Ready", text_color="#1DB954")
+
+            self.dispatch_ui(finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def browse_dir(self):
         folder = filedialog.askdirectory(initialdir=self.save_dir.get())
         if folder:
@@ -857,7 +1647,7 @@ class HiResRecorderApp(ctk.CTk):
             )
             for line in lines:
                 self.log_message(line)
-            self.after(0, self.refresh_source_quality_status)
+            self.dispatch_ui(self.refresh_source_quality_status)
             self.log_message("=== 診断完了 ===")
         threading.Thread(target=diag_thread, daemon=True).start()
 
@@ -1202,15 +1992,19 @@ class HiResRecorderApp(ctk.CTk):
         }
         
         self.log_message(f"録音解析開始: {len(audio) / self.sample_rate:.1f}s")
+        if self.qobuz_job is not None and self.qobuz_batch_capture:
+            self.was_standby = False
+            self._process_qobuz_batch_capture(audio, options)
+            return
         
         # 解析は別スレッドで行う
         def evaluate_and_show():
             try:
                 candidates = prepare_track_candidates(audio, list(self.recording_history), options, stop_info, self.log_message)
-                self.after(0, lambda: self.show_review_ui(candidates, options))
+                self.dispatch_ui(lambda: self.show_review_ui(candidates, options))
             except Exception as e:
                 self.log_message(f"解析中にエラーが発生しました: {e}")
-                self.after(0, self.on_processing_finished)
+                self.dispatch_ui(self.on_processing_finished)
             
         threading.Thread(target=evaluate_and_show, daemon=True).start()
 
@@ -1335,7 +2129,9 @@ class HiResRecorderApp(ctk.CTk):
         tabs.pack(fill="both", expand=True, padx=12, pady=12)
         recordings_tab = tabs.add("録音履歴")
         flac_tab = tabs.add("FLAC出力")
+        qobuz_jobs_tab = tabs.add("Qobuzジョブ")
         library_tab = tabs.add("ライブラリ変換")
+        self.build_qobuz_job_history_tab(qobuz_jobs_tab)
         self.build_library_conversion_tab(library_tab)
 
         toolbar = ctk.CTkFrame(recordings_tab, fg_color="transparent")
@@ -1588,8 +2384,8 @@ class HiResRecorderApp(ctk.CTk):
 
             def worker():
                 retry_flac_export(item, self.catalog_path, self.log_message)
-                self.after(0, render_flac)
-                self.after(0, render)
+                self.dispatch_ui(render_flac)
+                self.dispatch_ui(render)
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -1774,6 +2570,76 @@ class HiResRecorderApp(ctk.CTk):
         refresh = getattr(self, "library_ui_refresh", None)
         if refresh is not None:
             self.ui_queue.put(refresh)
+
+    def build_qobuz_job_history_tab(self, parent):
+        toolbar = ctk.CTkFrame(parent, fg_color="transparent")
+        toolbar.pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(
+            toolbar,
+            text="元プレイリスト順とレート別実行順をSQLiteで保持します",
+            text_color="#b7bec8",
+        ).pack(side="left")
+        scroll = ctk.CTkScrollableFrame(parent)
+        scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        def render():
+            for child in scroll.winfo_children():
+                child.destroy()
+            jobs = list_qobuz_playlist_jobs(database_path=self.catalog_path)
+            if not jobs:
+                ctk.CTkLabel(scroll, text="Qobuzプレイリスト録音履歴はありません").pack(
+                    pady=30
+                )
+                return
+            for job in jobs:
+                frame = ctk.CTkFrame(scroll, corner_radius=6)
+                frame.pack(fill="x", padx=4, pady=4)
+                status = job.get("status", "unknown")
+                color = (
+                    "#63f08f"
+                    if status == "complete"
+                    else "#ff5964"
+                    if status == "failed"
+                    else "#f0b429"
+                )
+                ctk.CTkLabel(
+                    frame,
+                    text=f"{job['playlist_name']}  [{status}]",
+                    text_color=color,
+                    font=ctk.CTkFont(weight="bold"),
+                    anchor="w",
+                ).pack(fill="x", padx=10, pady=(8, 2))
+                rates = " -> ".join(
+                    str(item.get("source_sample_rate"))
+                    for item in job.get("execution", [])
+                )
+                detail = (
+                    f"{job['completed_tracks']}/{job['eligible_tracks']}曲完了 / "
+                    f"失敗{job['failed_tracks']} / 除外{job['excluded_tracks']}\n"
+                    f"実行レート: {rates or '-'}"
+                )
+                if job.get("m3u8_path"):
+                    detail += f"\nM3U8: {job['m3u8_path']}"
+                if job.get("error"):
+                    detail += f"\n{job['error']}"
+                ctk.CTkLabel(
+                    frame,
+                    text=detail,
+                    text_color="#b7bec8",
+                    anchor="w",
+                    justify="left",
+                    wraplength=820,
+                ).pack(fill="x", padx=10, pady=(0, 8))
+
+        ctk.CTkButton(
+            toolbar,
+            text="更新",
+            width=70,
+            command=render,
+            fg_color="#30363d",
+            hover_color="#484f58",
+        ).pack(side="right")
+        render()
 
     def build_library_conversion_tab(self, parent):
         parent.grid_columnconfigure(0, weight=1)
@@ -2126,7 +2992,7 @@ class HiResRecorderApp(ctk.CTk):
                         start_button.configure(state="normal")
                         render()
 
-                    self.after(0, finish)
+                    self.dispatch_ui(finish)
                 except Exception as exc:
                     error = str(exc)
                     self.log_message(f"ライブラリ走査失敗: {error}")
@@ -2187,7 +3053,7 @@ class HiResRecorderApp(ctk.CTk):
                 self.status_label.configure(text="Ready", text_color="#1DB954")
             self.was_standby = False
 
-        self.after(0, update)
+        self.dispatch_ui(update)
 
     def poll_source(self):
         adapter = self.current_adapter()
@@ -2258,12 +3124,30 @@ class HiResRecorderApp(ctk.CTk):
                 )
 
             if self.is_standby and not self.is_recording and source_is_playing(info):
-                self.log_message(f"{adapter.name}再生検知: {info['artist']} - {info['name']}")
-                self.start_rec()
+                if getattr(self, "qobuz_job", None) is not None:
+                    expected = self.qobuz_batch_track
+                    if expected is not None and str(info.get("track_id")) == expected.track_id:
+                        self.log_message(
+                            f"Qobuzジョブ再生検知: {info['artist']} - {info['name']}"
+                        )
+                        self._start_qobuz_batch_capture(info)
+                else:
+                    self.log_message(f"{adapter.name}再生検知: {info['artist']} - {info['name']}")
+                    self.start_rec()
                 
             if self.is_recording:
                 # Track change auto-stop logic for SINGLE mode
-                if self.record_mode.get() == MODE_SINGLE:
+                if (
+                    getattr(self, "qobuz_job", None) is not None
+                    and getattr(self, "qobuz_batch_capture", False)
+                ):
+                    expected = self.qobuz_batch_track
+                    if expected is not None and str(info.get("track_id")) != expected.track_id:
+                        self.log_message(
+                            "Qobuzジョブ: 次曲への遷移を検知したため現在曲を確定します。"
+                        )
+                        self.stop_rec()
+                elif self.record_mode.get() == MODE_SINGLE:
                     if self.last_track_key and normalized_track_key(info) != self.last_track_key:
                         self.log_message("単曲モード: 曲の切り替わりを検知し、録音を自動停止します。")
                         self.stop_rec()
@@ -2302,7 +3186,12 @@ class HiResRecorderApp(ctk.CTk):
                     self.add_history_track(info, estimated_start)
                     self.log_message(f"曲変更: {info['artist']} - {info['name']}")
 
-            if not self.is_recording and not source_is_playing(info):
+            if (
+                getattr(self, "qobuz_job", None) is None
+                and self.provider.get() == PROVIDER_SPOTIFY
+                and not self.is_recording
+                and not source_is_playing(info)
+            ):
                 self.consider_idle_sample_rate_sync(info)
 
         elif info.get("status") in ("IDLE", "CLOSED", "UNAVAILABLE"):
@@ -2323,24 +3212,60 @@ class HiResRecorderApp(ctk.CTk):
                     self.log_message(f"{adapter.name}終了検知、録音停止")
                     self.stop_rec()
 
-            if not self.is_recording:
+            if (
+                not self.is_recording
+                and getattr(self, "qobuz_job", None) is None
+                and self.provider.get() == PROVIDER_SPOTIFY
+            ):
                 self.consider_idle_sample_rate_sync(info)
 
         self.after(CHECK_INTERVAL_MS, self.poll_source)
 
     def on_closing(self):
         self.library_queue.cancel()
+        if self.qobuz_job is not None:
+            self.qobuz_job.cancel("アプリ終了により中止されました")
         self.stop_audio_stream()
         if self.capture_spool is not None:
             self.capture_spool.discard()
         if self.pending_spool_audio is not None:
             self.pending_spool_audio.close(delete=False)
+        if self.qobuz_settings_transaction is not None:
+            result = self.qobuz_settings_transaction.restore()
+            for error in result.get("errors") or []:
+                self.log_message(f"終了時設定復元警告: {error}")
         self.destroy()
 
 
 if __name__ == "__main__":
-    if "--self-test-library-codecs" in sys.argv:
+    if "--restore-watchdog" in sys.argv:
+        index = sys.argv.index("--restore-watchdog")
+        parent_pid = int(sys.argv[index + 1])
+        journal_path = sys.argv[index + 2]
+        result = run_restore_watchdog(parent_pid, journal_path)
+        raise SystemExit(0 if result["restored"] else 1)
+    elif "--self-test-library-codecs" in sys.argv:
         diagnostics = library_codec_diagnostics()
+        print(json.dumps(diagnostics, ensure_ascii=False, sort_keys=True))
+        raise SystemExit(0 if diagnostics["ok"] else 1)
+    elif "--self-test-qobuz-accessibility" in sys.argv:
+        diagnostics = {"ok": False, "in_process": True, "uses_osascript": False}
+        automation = QobuzAutomation()
+        try:
+            automation.check_accessibility()
+            diagnostics["output_button_point"] = list(
+                automation.accessibility.output_button_point()
+            )
+            diagnostics["ok"] = True
+        except Exception as exc:
+            diagnostics["error"] = str(exc)
+            try:
+                diagnostics["visible_texts"] = (
+                    automation.accessibility.visible_text_diagnostics()
+                )
+                diagnostics["raw"] = automation.accessibility.raw_diagnostics()
+            except Exception as diagnostic_exc:
+                diagnostics["diagnostic_error"] = str(diagnostic_exc)
         print(json.dumps(diagnostics, ensure_ascii=False, sort_keys=True))
         raise SystemExit(0 if diagnostics["ok"] else 1)
     else:

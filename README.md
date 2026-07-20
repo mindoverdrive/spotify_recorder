@@ -1,6 +1,10 @@
 # Hi-Res Recorder
 
-Spotify/Qobuz DesktopのOffline再生出力をアプリ内で音量を変えずに32-bit floatで記録し、ネイティブレートのアーカイブFLACとTraktor向け24-bit/48kHz FLACを自動生成します。手動で入手したローカル音源も、別タブから24-bit/48kHz FLACへ一括変換できます。
+> **重要: 現在の開発版はエラーで本番利用できません。**
+>
+> Qobuzプレイリスト自動録音の実機検証中に、macOS Accessibility経由のQobuz操作・権限認識まわりでジョブ開始が停止する状態を確認しています。README以下の仕様は目標設計と実装中の内容を含みますが、現時点では「Qobuzのプレイリストをまとめて録音し、DJライブラリを作る」用途で完走保証できません。修正と実機再検証が終わるまで、本番音源の作成には使わないでください。
+
+Qobuz DesktopのOfflineプレイリストを一括処理し、各曲をネイティブレート・Unity Gainで記録して、アーカイブFLACとTraktor向け24-bit/48kHz FLACを自動生成します。Spotify Offlineの手動録音と、手動入手したローカル音源の24-bit/48kHz一括変換も別系統で利用できます。
 
 録音には、音楽アプリ専用の仮想オーディオ経路を使います。LoopbackはRogue Amoeba製の有料ルーティングアプリ、BlackHoleは無料で使える仮想オーディオドライバです。Macの通常の入力1/2chを直接録音すると、通知音やブラウザなど他アプリの音が混ざる可能性があります。専用の2ch経路を用意し、SpotifyまたはQobuzだけをそこへ出力してください。
 
@@ -41,7 +45,7 @@ READMEの手順に従い、uv環境、BlackHoleまたはLoopbackの録音専用2
 ### 自分でセットアップする場合
 
 1. Xcode Command Line Tools、Git、[uv](https://docs.astral.sh/uv/)をインストールします。
-2. [BlackHole](https://existential.audio/blackhole/)（無料）または[Loopback](https://rogueamoeba.com/loopback/)（有料）を導入し、Spotify/Qobuz専用のステレオ出力を作ります。通常のMacスピーカー出力や、通知音と共用する入力を録音先にしないでください。
+2. [BlackHole](https://existential.audio/blackhole/)（無料）または[Loopback](https://rogueamoeba.com/loopback/)（有料）を導入します。Qobuzには2ch Pass-Thruだけを持つ専用デバイスを作ります。Loopbackでは`Hi-Res Recorder Qobuz Loopback`のように、名前へ`Qobuz`と`Loopback`の両方を含めてください。Spotifyにも別の2chアプリソース専用デバイスを用意します。通常のMacスピーカー出力や、通知音と共用する16chデバイスを録音先にしないでください。
 3. SpotifyまたはQobuzの出力先をその専用経路に設定します。モニター再生が必要なら、録音経路とは別にスピーカーへ送ります。
 4. ターミナルで以下を実行します。`<repository-url>`は、このGitHubリポジトリのURLに置き換えます。
 
@@ -52,14 +56,14 @@ uv sync
 uv run python spotify_recorder.py
 ```
 
-5. macOSからマイク（オーディオ入力）権限を求められたら許可します。SpotifyのOffline Mode確認には「システム設定 > プライバシーとセキュリティ > アクセシビリティ」でHi-Res Recorderまたは実行中のターミナルも許可します。
-6. アプリのInput Deviceで専用経路を選び、左右の開始チャンネルがその経路のステレオ2chと一致することを確認します。
-7. 音楽サービス側の音量は100%にし、EQ、Crossfade、Automix、音量の均一化はOFFにします。Spotifyは対象をLossless設定で完全ダウンロードして`File > Offline Mode`をON、QobuzはOffline再生とExclusive ModeをONにします。
-8. まず短いテスト録音を行います。レビューで入力レート、LUFS、Peak、True Peak、疑義イベントを確認し、通知音や別アプリの音が混ざっていないことを再生して確かめます。問題があれば録音せず、ルーティングを修正します。
+5. macOSからマイク（オーディオ入力）権限を求められたら許可します。「システム設定 > プライバシーとセキュリティ > アクセシビリティ」でHi-Res Recorderを許可します。ソースから`uv run`で起動する開発時だけ、実行元のターミナルにも許可が必要です。これはSpotifyのOffline Mode確認と、Qobuzを曲頭から自動再生する操作に使います。
+6. アプリは起動時、名前に`Qobuz`と`Loopback`（または`BlackHole`）を含む入力を優先して自動選択します。見つからない場合だけInput Deviceで専用経路を選びます。Qobuzプレイリスト録音は専用2chデバイスの1–2ch固定で、共有16ch構成は開始拒否されます。
+7. 音楽サービス側の音量は100%にし、EQ、Crossfade、Automix、音量の均一化はOFFにします。Spotifyは対象をLossless設定で完全ダウンロードして`File > Offline Mode`をON、Qobuzは対象プレイリストを最高品質で完全ダウンロードしてから使います。
+8. Qobuzでは対象曲を1つのプレイリストへまとめ、全曲を最高品質で完全ダウンロードします。本アプリでプレイリストを更新して「事前検査」を実行し、未完了曲が0件になってから開始します。不要な未完了曲だけは確認画面で今回のジョブから明示的に除外できます。
 9. 「録音/出力」からFLAC出力タブを開き、Archive/DJ種別、入出力レート、SRC、ディザ、安全減衰量、WAV削除状態、ジャケットを確認します。拒否・失敗時はWAVが残るため、原因を解消してから再実行できます。
 10. 手動ダウンロード音源を変換する場合は「ライブラリ変換」タブで入力フォルダとSSD上の出力先を選び、事前走査後に変換します。入力ファイルは削除・上書きされません。
 
-SpotifyとQobuzのどちらもStandbyと自動停止に対応します。サービスを選ぶと「監視対象」に現在のOfflineサービスが表示されます。StandbyをONにすると選択中サービスの再生開始で録音を始め、自動停止をONにすると停止・一時停止が設定した猶予時間を超えた時点で録音を止めます。
+Spotifyは従来の手動録音、Standby、自動停止を利用できます。Qobuzではこれらの手動UIを使用せず、プレイリストジョブが曲ID、曲頭、停止、次曲遷移を監視します。ジョブはソースレートごとにまとめて実行しますが、SQLite、FLACタグ、M3U8には元プレイリスト順を保持します。
 
 ### 録音時の判断
 
@@ -88,7 +92,7 @@ Soundiizが移すのは曲名、アーティスト、アルバムなどのメタ
 | 転送元 | Soundiizで行うこと | 本アプリで行うこと |
 |---|---|---|
 | Spotify | Qobuzへ移す場合だけ使用。Spotifyで録音するなら転送不要 | Spotify側で対象を完全ダウンロードし、Offline ModeをONにして録音 |
-| Qobuz | Spotifyへ移す場合だけ使用。Qobuzで録音するなら転送不要 | Qobuz側で最高品質を完全ダウンロードし、Offline・Exclusive Modeで録音 |
+| Qobuz | Spotifyへ移す場合だけ使用。Qobuzで録音するなら転送不要 | Qobuz側で最高品質を完全ダウンロードし、プレイリスト事前検査後に録音 |
 | Apple Music / TIDAL / Deezer / Amazon Music | プレイリスト等をSpotifyまたはQobuzへコピー | 移行先で各曲を再確認・完全ダウンロードしてから録音 |
 | YouTube Music / YouTube / SoundCloud / Audiomack | 動画題名や不完全なメタデータを含みやすいため、転送後の照合を特に厳格に確認 | 誤ったカバー、ライブ版、リミックスを修正してから録音 |
 | Beatport / Beatsource / Bandcamp / Discogs等 | 対応している項目だけを移行。購入ファイルそのものは転送されない | 購入済み原本がある場合は、再録音より原本利用を優先 |
@@ -118,11 +122,17 @@ Spotifyの非公開prefsからダウンロード品質、音量の均一化、Au
 
 ## Qobuz Offlineモード
 
-Qobuz Desktopのローカル状態、SQLite、ログを読み取り専用で監視します。Qobuzの録音経路はOffline固定で、Streamingへの切り替えや手動証跡による品質ゲートの迂回はできません。認証情報、非公開API、Qobuz Connect、暗号化キャッシュ、復号鍵にはアクセスしません。
+Qobuz Desktopのローカル状態、SQLite、ログを読み取り専用で監視します。Qobuzの録音経路はOfflineプレイリスト固定で、Streamingへの切り替えや手動証跡による品質ゲートの迂回はできません。認証情報、非公開API、Qobuz Connect、暗号化キャッシュ、復号鍵にはアクセスしません。
 
-完全ダウンロード、曲ID、配信形式、サンプルレート、bit深度、音量100%、ミュートOFF、Exclusive Mode ONを確認できた場合だけ録音できます。16/24-bitおよび44.1/48/88.2/96/176.4/192kHzを受け入れ、録音デバイスのレートがソースと一致しない場合は開始を拒否します。
+Qobuz Desktop 8.2系では`playqueue.data.currentIndex`から現在曲を特定し、DB内の`44.1`、`96.0`等のkHz表記を`44100Hz`、`96000Hz`へ変換して扱います。キュー履歴や次曲を現在曲として誤認しないよう、現在曲ID、完全DLレコード、再生ログの対応を確認します。
 
-停止・一時停止中は、選択中の単一Loopback/BlackHoleをソースレートへ自動同期します。再生中はデバイスを再初期化せず、不一致の録音を拒否します。24/44.1を48kHzで直接録音するのではなく、44.1kHzのまま記録してからDJ版だけSoXR VHQで24/48へ変換します。
+Qobuzのformat IDは「最大96kHz」等の配信品質枠であり、その曲の実サンプルレートそのものではありません。アプリでは品質枠とDBで確認した実レートを分けて表示し、例えば24-bit/44.1kHz曲を96kHz音源とは扱いません。
+
+録音前にプレイリスト全曲の完全ダウンロード、曲ID、配信形式、実サンプルレート、bit深度、2chを走査します。さらに録音時に音量100%、ミュートOFF、Qobuz出力先と録音入力の一致を確認します。16/24-bitおよび44.1/48/88.2/96/176.4/192kHzを受け入れ、1曲でも未完了なら開始を拒否します。
+
+macOS版では排他制御の有無を品質条件や証跡にしません。代わりに、専用2ch仮想デバイス、実レート一致、他アプリを通さない経路を検証します。ジョブ開始時にCoreAudioの既定入力、対象デバイスのレート、Qobuzの出力先と再生状態を保存し、正常終了・中止・異常終了後に復元します。Qobuzの非公開設定ファイルは変更せず、公開URLスキームとmacOS Accessibilityだけで操作します。Accessibility要素の探索、スクロール、クリックはHi-Res Recorder本体から直接実行し、別途`osascript`へ操作権限を与える設計にはしていません。
+
+実行時は曲を実レート昇順にまとめ、各曲の再生前に専用Loopback/BlackHoleをソースレートへ同期します。再生開始後にレートが変わった場合は録音を中止します。24/44.1を48kHzで直接録音するのではなく、44.1kHzのまま記録してからDJ版だけSoXR VHQで24/48へ変換します。各曲は最大2回再試行し、重大な疑義が残る曲は削除せず隔離状態にします。
 
 Qobuz公式資料:
 
@@ -133,7 +143,7 @@ Qobuz公式資料:
 
 `Spotify/Qobuz Offline -> 単一2ch LoopbackまたはBlackHole -> Hi-Res Recorder`を使用します。Spotifyは44.1kHz入力を要求します。QobuzではCoreAudio Device UIDとnominal sample rateを照合し、Aggregate Device、Multi-Output Device、レート不一致、非ステレオ、途中のレート変更を拒否します。
 
-Qobuzは音量100%、Exclusive Mode ON、最高配信品質を使用してください。異なるサンプルレートの曲はセッションを分けて録音します。24/96や24/192も録音中は元レートを維持し、録音完了後にDJ版だけ24/48へ変換します。
+Qobuzは音量100%、最高配信品質を使用してください。異なるサンプルレートの曲は曲ごとに入力レートを同期して録音します。24/96や24/192も録音中は元レートを維持し、録音完了後にDJ版だけ24/48へ変換します。
 
 ## ライブラリ一括変換
 
@@ -159,7 +169,7 @@ Auto GainはON、Mixer Headroomは-6dBを基準にします。Spotify版とQobuz
 
 ## 履歴と復旧
 
-保存曲、サービス、Qobuz曲ID、ソース形式、LUFS、Peak、True Peak、品質合否、疑義時刻、再録要否をSQLiteへ保存します。管理画面は録音履歴、FLAC出力、ライブラリ変換の3タブで、Archive/DJ、入出力レート、SoXR品質、Linear Phase、ディザ方式と理由、安全減衰量、拒否理由、ジャケット、WAV削除結果、一括変換状態を確認できます。
+保存曲、サービス、Qobuzプレイリスト/曲ID、元順序、レート別実行順、ソース形式、LUFS、Peak、True Peak、品質合否、疑義時刻、再録要否をSQLiteへ保存します。管理画面は録音履歴、FLAC出力、Qobuzジョブ、ライブラリ変換の4タブで、Archive/DJ、入出力レート、SoXR品質、Linear Phase、ディザ方式と理由、安全減衰量、拒否理由、ジャケット、WAV削除結果、一括変換状態を確認できます。
 
 ```text
 ~/Library/Application Support/HiResRecorder/recordings.sqlite3
@@ -182,4 +192,6 @@ uv run python -m PyInstaller --clean --noconfirm HiResRecorder.spec
 dist/Hi-Res\ Recorder.app/Contents/MacOS/HiResRecorder --self-test-library-codecs
 ```
 
-出力は`dist/Hi-Res Recorder.app`です。自己診断は配布アプリ内のPyAV/FFmpegがAAC、ALAC、FLAC、MP3、Vorbis、Opusを復号可能か確認します。Qobuz連携はfixtureによる自動テストを備えていますが、実機のアプリ構造やオーディオデバイスはバージョン・環境で変わります。44.1/96/192kHzの実機録音、再生、品質レビューを行ってから本番利用してください。
+出力は`dist/Hi-Res Recorder.app`です。自己診断は配布アプリ内のPyAV/FFmpegがAAC、ALAC、FLAC、MP3、Vorbis、Opusを復号可能か確認します。
+
+このアプリは開発途上です。Qobuz DBとAccessibility UIは公式の外部連携APIではなく、アプリ更新で構造が変わる可能性があります。fixtureによる自動テストだけで本番品質を保証せず、使用中のQobuz版と専用デバイスで44.1/48/96/192kHzの短い実機試験、設定復元、再生、品質レビューを確認してからDJライブラリの本番作成に使用してください。

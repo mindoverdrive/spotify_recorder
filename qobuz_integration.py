@@ -5,15 +5,31 @@ import plistlib
 import re
 import sqlite3
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 
 QOBUZ_FORMATS = {
     5: {"label": "MP3", "lossless": False},
-    6: {"label": "CD Lossless", "lossless": True, "max_rate": 44100, "bit_depth": 16},
-    7: {"label": "Hi-Res 96", "lossless": True, "max_rate": 96000, "bit_depth": 24},
-    27: {"label": "Hi-Res 192", "lossless": True, "max_rate": 192000, "bit_depth": 24},
+    6: {
+        "label": "Lossless配信枠(16-bit)",
+        "lossless": True,
+        "max_rate": 44100,
+        "bit_depth": 16,
+    },
+    7: {
+        "label": "Hi-Res配信枠(最大96kHz)",
+        "lossless": True,
+        "max_rate": 96000,
+        "bit_depth": 24,
+    },
+    27: {
+        "label": "Hi-Res配信枠(最大192kHz)",
+        "lossless": True,
+        "max_rate": 192000,
+        "bit_depth": 24,
+    },
 }
 QOBUZ_SUPPORTED_SAMPLE_RATES = {44100, 48000, 88200, 96000, 176400, 192000}
 SUPPORTED_SCHEMA_COLUMNS = {
@@ -26,6 +42,12 @@ SUPPORTED_SCHEMA_COLUMNS = {
     "duration",
     "is_completed",
 }
+QOBUZ_PLAYBACK_EVENT_PATTERN = re.compile(
+    r"(?P<timestamp>\d{4}-\d\d-\d\d[T ][^ ]+).*?"
+    r"(?:Status has changed to (?P<state>Playing|Paused|Stopped)|"
+    r"Play track (?P<play>\d+)|Pause track (?P<pause>\d+))",
+    re.IGNORECASE,
+)
 
 
 def default_qobuz_dir():
@@ -97,6 +119,65 @@ def _as_float(value):
         return None
 
 
+def _normalize_sample_rate(value):
+    rate = _as_float(value)
+    if rate is None or rate <= 0:
+        return None
+    if rate <= 384.0:
+        rate *= 1000.0
+    return int(round(rate))
+
+
+def _current_queue_track(payload):
+    playqueue = payload.get("playqueue") if isinstance(payload, dict) else None
+    data = playqueue.get("data") if isinstance(playqueue, dict) else None
+    if not isinstance(data, dict):
+        return {}
+    index = _as_int(data.get("currentIndex"))
+    if index is None or index < 0:
+        return {}
+    candidates = []
+    if data.get("shuffled") and isinstance(data.get("shuffledItems"), list):
+        candidates.append(data["shuffledItems"])
+    if isinstance(data.get("items"), list):
+        candidates.append(data["items"])
+    for items in candidates:
+        if index >= len(items):
+            continue
+        item = items[index]
+        if isinstance(item, dict) and (
+            item.get("trackId") is not None or item.get("track_id") is not None
+        ):
+            return item
+    return {}
+
+
+def _modern_player_position(payload):
+    try:
+        position = payload["player"]["data"]["position"]
+    except (KeyError, TypeError):
+        return None, None
+    if not isinstance(position, dict):
+        return None, None
+    value = _as_float(position.get("value"))
+    timestamp = _as_float(position.get("timestamp"))
+    position_sec = None if value is None else value / 1000.0
+    timestamp_epoch = None if timestamp is None else timestamp / 1000.0
+    return position_sec, timestamp_epoch
+
+
+def _modern_audio_output(payload):
+    try:
+        data = payload["audioOutputs"]["data"]
+    except (KeyError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "output_device_name": data.get("current"),
+    }
+
+
 def _track_candidate(payload):
     candidates = []
     for node in _walk(payload):
@@ -113,7 +194,7 @@ def _track_candidate(payload):
 
 
 def parse_qobuz_player_state(payload):
-    track = _track_candidate(payload)
+    track = _current_queue_track(payload) or _track_candidate(payload)
     track_id = (
         track.get("track_id")
         or track.get("trackId")
@@ -139,30 +220,119 @@ def parse_qobuz_player_state(payload):
     elif state_text in {"0", "stopped", "stop", "idle"}:
         state_text = "stopped"
 
+    position, position_timestamp = _modern_player_position(payload)
+    if position is None:
+        position = _as_float(
+            _first_key(payload, ("position", "currentPosition", "positionSec"))
+        ) or 0.0
+    if state_text == "unknown" and position_timestamp is not None:
+        if abs(time.time() - position_timestamp) <= 5.0:
+            state_text = "playing"
+
     volume = _as_float(_first_key(payload, ("volume", "playerVolume")))
     if volume is not None and 0.0 <= volume <= 1.0:
         volume *= 100.0
     muted = _first_key(payload, ("muted", "isMuted"), (bool, int))
-    exclusive = _first_key(payload, ("exclusiveMode", "isExclusiveMode"), (bool, int))
-    return {
+    modern_output = _modern_audio_output(payload)
+    result = {
         "status": "OK" if track_id is not None else "IDLE",
         "track_id": None if track_id is None else str(track_id),
         "name": str(title),
         "artist": str(artist),
         "album": str(album),
         "state": state_text,
-        "position": _as_float(
-            _first_key(payload, ("position", "currentPosition", "positionSec"))
-        )
-        or 0.0,
+        "position": position,
+        "position_timestamp_epoch": position_timestamp,
         "duration": _as_float(track.get("duration")) or 0.0,
         "volume_percent": volume,
         "muted": None if muted is None else bool(muted),
-        "exclusive_mode": None if exclusive is None else bool(exclusive),
         "output_device_name": _first_key(
             payload, ("deviceName", "outputDeviceName", "currentDeviceName")
         ),
     }
+    if modern_output.get("output_device_name"):
+        result["output_device_name"] = modern_output["output_device_name"]
+    return result
+
+
+def read_qobuz_playback_log_state(qobuz_dir=None, tail_bytes=512 * 1024):
+    base = qobuz_dir or default_qobuz_dir()
+    paths = sorted(
+        glob.glob(os.path.join(base, "logs", "rapport_qobuz*.txt")),
+        key=os.path.getmtime,
+    )[-4:]
+    latest_state = None
+    latest_state_epoch = None
+    latest_track_id = None
+    latest_track_epoch = None
+    for path in paths:
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as handle:
+                handle.seek(max(0, size - int(tail_bytes)))
+                text = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            match = QOBUZ_PLAYBACK_EVENT_PATTERN.search(line)
+            if not match:
+                continue
+            timestamp_epoch = _timestamp_epoch(match.group("timestamp"))
+            if timestamp_epoch is None:
+                continue
+            if match.group("play"):
+                if latest_track_epoch is None or timestamp_epoch >= latest_track_epoch:
+                    latest_track_id = match.group("play")
+                    latest_track_epoch = timestamp_epoch
+                if latest_state_epoch is None or timestamp_epoch >= latest_state_epoch:
+                    latest_state = "playing"
+                    latest_state_epoch = timestamp_epoch
+            elif match.group("pause"):
+                if latest_track_epoch is None or timestamp_epoch >= latest_track_epoch:
+                    latest_track_id = match.group("pause")
+                    latest_track_epoch = timestamp_epoch
+                if latest_state_epoch is None or timestamp_epoch >= latest_state_epoch:
+                    latest_state = "paused"
+                    latest_state_epoch = timestamp_epoch
+            elif latest_state_epoch is None or timestamp_epoch >= latest_state_epoch:
+                latest_state = str(match.group("state")).lower()
+                latest_state_epoch = timestamp_epoch
+    return {
+        "state": latest_state,
+        "state_timestamp_epoch": latest_state_epoch,
+        "track_id": latest_track_id,
+        "track_timestamp_epoch": latest_track_epoch,
+    }
+
+
+def read_qobuz_local_settings(qobuz_dir=None):
+    base = qobuz_dir or default_qobuz_dir()
+    paths = sorted(
+        glob.glob(os.path.join(base, "settings-*.json"))
+        + glob.glob(os.path.join(base, "settings.json")),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    result = {"volume_percent": None, "muted": None, "settings_path": None}
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        legacy = payload.get("old") if isinstance(payload, dict) else None
+        if not isinstance(legacy, dict):
+            legacy = payload if isinstance(payload, dict) else {}
+        volume = _as_float(legacy.get("volume"))
+        muted = legacy.get("muted")
+        if volume is not None or isinstance(muted, (bool, int)):
+            result.update(
+                volume_percent=volume,
+                muted=None if muted is None else bool(muted),
+                settings_path=path,
+            )
+            break
+    return result
 
 
 def read_qobuz_player_state(qobuz_dir=None):
@@ -177,6 +347,24 @@ def read_qobuz_player_state(qobuz_dir=None):
     except (OSError, json.JSONDecodeError) as exc:
         return {"status": "UNAVAILABLE", "error": str(exc), "player_path": path}
     result = parse_qobuz_player_state(payload)
+    log_state = read_qobuz_playback_log_state(base)
+    position_timestamp = result.get("position_timestamp_epoch")
+    log_timestamp = log_state.get("state_timestamp_epoch")
+    if log_state.get("state") and (
+        position_timestamp is None
+        or (log_timestamp is not None and log_timestamp >= position_timestamp)
+        or result.get("state") == "unknown"
+    ):
+        result["state"] = log_state["state"]
+    if not result.get("track_id") and log_state.get("track_id"):
+        result["track_id"] = str(log_state["track_id"])
+        result["status"] = "OK"
+    settings = read_qobuz_local_settings(base)
+    if result.get("volume_percent") is None:
+        result["volume_percent"] = settings.get("volume_percent")
+    if result.get("muted") is None:
+        result["muted"] = settings.get("muted")
+    result["settings_path"] = settings.get("settings_path")
     result["player_path"] = path
     return result
 
@@ -221,6 +409,18 @@ def read_qobuz_track_record(track_id, database_path=None):
     except json.JSONDecodeError:
         data = {}
     format_id = _as_int(result.get("format") or data.get("format_id"))
+    artist = data.get("performer") or data.get("artist")
+    if isinstance(artist, dict):
+        artist = artist.get("name") or artist.get("display_name")
+    album = data.get("album")
+    album_title = None
+    artwork = None
+    if isinstance(album, dict):
+        album_title = album.get("title") or album.get("name")
+        images = album.get("image")
+        if isinstance(images, dict):
+            artwork = images.get("large") or images.get("small")
+    title = data.get("title") or result.get("title")
     result.update(
         {
             "available": True,
@@ -229,18 +429,40 @@ def read_qobuz_track_record(track_id, database_path=None):
             "format_label": QOBUZ_FORMATS.get(format_id, {}).get(
                 "label", f"format {format_id}"
             ),
-            "source_sample_rate": _as_int(
-                result.get("sampling_rate") or data.get("sampling_rate")
+            "source_sample_rate": _normalize_sample_rate(
+                result.get("sampling_rate")
+                or data.get("sampling_rate")
+                or data.get("maximum_sampling_rate")
             ),
             "source_bit_depth": _as_int(
-                result.get("bit_depth") or data.get("bit_depth")
+                result.get("bit_depth")
+                or data.get("bit_depth")
+                or data.get("maximum_bit_depth")
             ),
-            "source_channels": _as_int(data.get("channels")),
+            "source_channels": _as_int(
+                data.get("channels") or data.get("maximum_channel_count")
+            ),
             "duration": _as_float(result.get("duration") or data.get("duration")) or 0.0,
             "is_completed": bool(result.get("is_completed")),
             "raw_data": data,
+            "album_id": (
+                str(album.get("id") or album.get("qobuz_id"))
+                if isinstance(album, dict)
+                and (album.get("id") is not None or album.get("qobuz_id") is not None)
+                else None
+            ),
+            "track_number": _as_int(data.get("track_number")),
+            "media_number": _as_int(data.get("media_number")),
         }
     )
+    if title:
+        result["name"] = str(title)
+    if artist:
+        result["artist"] = str(artist)
+    if album_title:
+        result["album"] = str(album_title)
+    if artwork:
+        result["artwork_url"] = str(artwork)
     return result
 
 
@@ -319,7 +541,9 @@ class QobuzLogTailer:
 
 def _timestamp_epoch(value):
     try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(
+            str(value).rstrip(":").replace("Z", "+00:00")
+        )
     except ValueError:
         return None
     if parsed.tzinfo is None:
@@ -419,12 +643,8 @@ def evaluate_qobuz_capture_gate(snapshot, device):
         warnings.append(f"Qobuz音量が100%ではありません: {snapshot['volume_percent']:.1f}%")
     if snapshot.get("muted") is True:
         warnings.append("Qobuzがミュートされています")
-    if snapshot.get("exclusive_mode") is False:
-        warnings.append("Qobuz Exclusive ModeがOFFです")
     if source_verified and snapshot.get("volume_percent") is None:
         warnings.append("Qobuz音量100%を検証できません")
-    if source_verified and snapshot.get("exclusive_mode") is None:
-        warnings.append("Qobuz Exclusive Modeを検証できません")
     if source_verified and snapshot.get("muted") is None:
         warnings.append("QobuzミュートOFFを検証できません")
 
@@ -466,7 +686,6 @@ def evaluate_qobuz_capture_gate(snapshot, device):
             "format_label": snapshot.get("format_label"),
             "is_completed": snapshot.get("is_completed"),
             "volume_percent": snapshot.get("volume_percent"),
-            "exclusive_mode": snapshot.get("exclusive_mode"),
             "output_device_name": snapshot.get("output_device_name"),
             "device_uid": device.get("uid"),
             "device_transport": device.get("transport"),

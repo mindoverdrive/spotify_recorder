@@ -136,8 +136,17 @@ class QobuzSourceAdapter:
                 f"{snapshot.get('source_bit_depth', '?')}-bit / "
                 f"{snapshot.get('source_sample_rate', '?')}Hz / bit一致未証明"
             )
-            passed = True
             warnings = []
+            if not snapshot.get("is_completed"):
+                warnings.append("Qobuz Offlineトラックの完全ダウンロードを確認できません")
+            volume = snapshot.get("volume_percent")
+            if volume is None:
+                warnings.append("Qobuz音量100%を検証できません")
+            elif abs(float(volume) - 100.0) > 0.01:
+                warnings.append(f"Qobuz音量が100%ではありません: {float(volume):.1f}%")
+            if snapshot.get("muted") is not False:
+                warnings.append("QobuzミュートOFFを確認できません")
+            passed = not warnings
         else:
             label = "Qobuzローカル証跡を取得できません"
             passed = False

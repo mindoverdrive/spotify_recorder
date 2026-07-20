@@ -4,7 +4,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def legacy_catalog_path():
@@ -286,11 +286,274 @@ def _connect(database_path):
         "ON library_assets(pcm_sha256, source_sample_rate, source_channels, status)"
     )
     connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS qobuz_playlist_jobs (
+            job_id TEXT PRIMARY KEY,
+            playlist_id TEXT NOT NULL,
+            playlist_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            total_tracks INTEGER NOT NULL,
+            eligible_tracks INTEGER NOT NULL,
+            excluded_tracks INTEGER NOT NULL DEFAULT 0,
+            blocking_tracks INTEGER NOT NULL DEFAULT 0,
+            completed_tracks INTEGER NOT NULL DEFAULT 0,
+            failed_tracks INTEGER NOT NULL DEFAULT 0,
+            current_original_index INTEGER,
+            execution_json TEXT NOT NULL DEFAULT '[]',
+            settings_journal_path TEXT,
+            m3u8_path TEXT,
+            error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS qobuz_playlist_tracks (
+            job_id TEXT NOT NULL,
+            original_index INTEGER NOT NULL,
+            execution_index INTEGER,
+            track_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            artist TEXT NOT NULL,
+            album TEXT NOT NULL,
+            duration_sec REAL NOT NULL,
+            source_sample_rate INTEGER,
+            source_bit_depth INTEGER,
+            source_channels INTEGER,
+            format_id INTEGER,
+            excluded INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            archive_path TEXT,
+            dj_path TEXT,
+            requires_rerecord INTEGER NOT NULL DEFAULT 0,
+            issues_json TEXT NOT NULL DEFAULT '[]',
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(job_id, original_index),
+            FOREIGN KEY(job_id) REFERENCES qobuz_playlist_jobs(job_id) ON DELETE CASCADE
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_qobuz_playlist_tracks_status "
+        "ON qobuz_playlist_tracks(job_id, status, execution_index)"
+    )
+    connection.execute(
         "INSERT OR REPLACE INTO schema_metadata(key, value) VALUES('version', ?)",
         (str(SCHEMA_VERSION),),
     )
     connection.commit()
     return connection
+
+
+def _item_field(item, key):
+    if isinstance(item, dict):
+        return item.get(key)
+    return getattr(item, key)
+
+
+def create_qobuz_playlist_job(
+    job_id,
+    scan,
+    execution_tracks,
+    settings_journal_path=None,
+    database_path=None,
+):
+    target = database_path or default_catalog_path()
+    payload = scan.to_dict() if hasattr(scan, "to_dict") else dict(scan)
+    tracks = list(getattr(scan, "tracks", payload.get("tracks", [])))
+    execution = list(execution_tracks)
+    execution_positions = {
+        int(_item_field(track, "original_index")): index
+        for index, track in enumerate(execution)
+    }
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _connect(target) as connection:
+        connection.execute(
+            """
+            INSERT INTO qobuz_playlist_jobs (
+                job_id, playlist_id, playlist_name, status, total_tracks,
+                eligible_tracks, excluded_tracks, blocking_tracks, execution_json,
+                settings_journal_path, created_at, updated_at
+            ) VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(job_id),
+                str(payload["playlist_id"]),
+                str(payload["name"]),
+                int(payload["total_tracks"]),
+                int(payload["eligible_tracks"]),
+                int(payload["excluded_tracks"]),
+                int(payload["blocking_tracks"]),
+                json.dumps(
+                    [
+                        {
+                            "original_index": int(_item_field(item, "original_index")),
+                            "track_id": str(_item_field(item, "track_id")),
+                            "source_sample_rate": _item_field(
+                                item, "source_sample_rate"
+                            ),
+                        }
+                        for item in execution
+                    ],
+                    ensure_ascii=False,
+                ),
+                settings_journal_path,
+                now,
+                now,
+            ),
+        )
+        for item in tracks:
+            track = item.to_dict() if hasattr(item, "to_dict") else dict(item)
+            original_index = int(track["original_index"])
+            status = (
+                "excluded"
+                if track.get("excluded")
+                else "blocked"
+                if track.get("blocking")
+                else "pending"
+            )
+            connection.execute(
+                """
+                INSERT INTO qobuz_playlist_tracks (
+                    job_id, original_index, execution_index, track_id, title,
+                    artist, album, duration_sec, source_sample_rate,
+                    source_bit_depth, source_channels, format_id, excluded,
+                    status, issues_json, evidence_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(job_id),
+                    original_index,
+                    execution_positions.get(original_index),
+                    str(track["track_id"]),
+                    str(track.get("name") or "Unknown"),
+                    str(track.get("artist") or "Unknown"),
+                    str(track.get("album") or "Unknown"),
+                    float(track.get("duration") or 0.0),
+                    track.get("source_sample_rate"),
+                    track.get("source_bit_depth"),
+                    track.get("source_channels"),
+                    track.get("format_id"),
+                    int(bool(track.get("excluded"))),
+                    status,
+                    json.dumps(track.get("issues") or [], ensure_ascii=False),
+                    json.dumps(track, ensure_ascii=False),
+                    now,
+                ),
+            )
+    return str(job_id)
+
+
+def update_qobuz_playlist_job(job_id, database_path=None, **fields):
+    target = database_path or default_catalog_path()
+    allowed = {
+        "status",
+        "completed_tracks",
+        "failed_tracks",
+        "current_original_index",
+        "settings_journal_path",
+        "m3u8_path",
+        "error",
+    }
+    assignments = []
+    values = []
+    for key, value in fields.items():
+        if key not in allowed:
+            continue
+        assignments.append(f"{key} = ?")
+        values.append(value)
+    if not assignments:
+        return
+    assignments.append("updated_at = ?")
+    values.append(datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    values.append(str(job_id))
+    with _connect(target) as connection:
+        connection.execute(
+            f"UPDATE qobuz_playlist_jobs SET {', '.join(assignments)} WHERE job_id = ?",
+            values,
+        )
+
+
+def update_qobuz_playlist_track(
+    job_id,
+    original_index,
+    database_path=None,
+    **fields,
+):
+    target = database_path or default_catalog_path()
+    allowed = {
+        "status",
+        "attempts",
+        "archive_path",
+        "dj_path",
+        "requires_rerecord",
+        "evidence_json",
+        "error",
+    }
+    assignments = []
+    values = []
+    for key, value in fields.items():
+        if key not in allowed:
+            continue
+        if key == "evidence_json" and not isinstance(value, str):
+            value = json.dumps(value or {}, ensure_ascii=False)
+        assignments.append(f"{key} = ?")
+        values.append(value)
+    if not assignments:
+        return
+    assignments.append("updated_at = ?")
+    values.append(datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    values.extend((str(job_id), int(original_index)))
+    with _connect(target) as connection:
+        connection.execute(
+            f"UPDATE qobuz_playlist_tracks SET {', '.join(assignments)} "
+            "WHERE job_id = ? AND original_index = ?",
+            values,
+        )
+
+
+def get_qobuz_playlist_job(job_id, database_path=None):
+    target = database_path or default_catalog_path()
+    with _connect(target) as connection:
+        job_row = connection.execute(
+            "SELECT * FROM qobuz_playlist_jobs WHERE job_id = ?", (str(job_id),)
+        ).fetchone()
+        track_rows = connection.execute(
+            "SELECT * FROM qobuz_playlist_tracks WHERE job_id = ? "
+            "ORDER BY original_index",
+            (str(job_id),),
+        ).fetchall()
+    if job_row is None:
+        return None
+    job = dict(job_row)
+    job["execution"] = json.loads(job.pop("execution_json") or "[]")
+    job["tracks"] = []
+    for row in track_rows:
+        item = dict(row)
+        item["issues"] = json.loads(item.pop("issues_json") or "[]")
+        item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+        job["tracks"].append(item)
+    return job
+
+
+def list_qobuz_playlist_jobs(limit=100, database_path=None):
+    target = database_path or default_catalog_path()
+    with _connect(target) as connection:
+        rows = connection.execute(
+            "SELECT * FROM qobuz_playlist_jobs ORDER BY created_at DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["execution"] = json.loads(item.pop("execution_json") or "[]")
+        result.append(item)
+    return result
 
 
 def _event_severity(event):

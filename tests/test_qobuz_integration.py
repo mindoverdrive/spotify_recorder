@@ -62,6 +62,81 @@ def create_qobuz_fixture(directory, completed=1, sample_rate=96000):
         )
 
 
+def create_qobuz_v8_fixture(directory):
+    player = {
+        "player": {
+            "version": 2,
+            "data": {"position": {"value": 112736, "timestamp": 1}},
+        },
+        "playqueue": {
+            "version": 3,
+            "data": {
+                "currentIndex": 1,
+                "shuffled": False,
+                "items": [
+                    {"queueItemId": "q1", "trackId": 111},
+                    {"queueItemId": "q2", "trackId": 293140445},
+                ],
+                "history": [999, 888, 777],
+            },
+        },
+        "audioOutputs": {
+            "version": 6,
+            "data": {
+                "current": "Loopback Audio",
+                "globalSettings": {"exclusiveMode": True},
+            },
+        },
+    }
+    with open(os.path.join(directory, "player-0.json"), "w", encoding="utf-8") as handle:
+        json.dump(player, handle)
+    with open(os.path.join(directory, "settings-1.json"), "w", encoding="utf-8") as handle:
+        json.dump({"old": {"volume": 100, "muted": False}}, handle)
+    os.makedirs(os.path.join(directory, "logs"))
+    with open(
+        os.path.join(directory, "logs", "rapport_qobuz0.txt"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        handle.write("2026-07-19T13:20:38.845Z: Play track 293140445\n")
+    database = os.path.join(directory, "qobuz.db")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE L_Track (
+                track_id TEXT, data TEXT, status TEXT, format INTEGER,
+                sampling_rate REAL, bit_depth INTEGER, duration REAL,
+                is_completed INTEGER
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO L_Track VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "293140445",
+                json.dumps(
+                    {
+                        "id": 293140445,
+                        "title": "Return To Chinatown",
+                        "performer": {"name": "Knifehandchop"},
+                        "album": {
+                            "title": "Random Shit 1998-2008",
+                            "image": {"large": "/tmp/qobuz-cover.png"},
+                        },
+                        "maximum_channel_count": 2,
+                        "maximum_bit_depth": 24,
+                    }
+                ),
+                "Cache",
+                7,
+                44.1,
+                24,
+                253.0,
+                1,
+            ),
+        )
+
+
 class QobuzStateTests(unittest.TestCase):
     def test_parses_player_and_track_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -72,9 +147,9 @@ class QobuzStateTests(unittest.TestCase):
         self.assertEqual(snapshot["track_id"], "12345")
         self.assertEqual(snapshot["source_sample_rate"], 96000)
         self.assertEqual(snapshot["source_bit_depth"], 24)
-        self.assertEqual(snapshot["format_label"], "Hi-Res 96")
+        self.assertEqual(snapshot["format_label"], "Hi-Res配信枠(最大96kHz)")
         self.assertTrue(snapshot["is_completed"])
-        self.assertTrue(snapshot["exclusive_mode"])
+        self.assertNotIn("exclusive_mode", snapshot)
         self.assertEqual(snapshot["volume_percent"], 100.0)
         self.assertTrue(source_is_playing(snapshot))
 
@@ -112,6 +187,27 @@ class QobuzStateTests(unittest.TestCase):
         self.assertFalse(source_is_playing({**base, "state": "stopped"}))
         self.assertFalse(source_is_playing({"status": "UNAVAILABLE", "state": "playing"}))
 
+    def test_qobuz_v8_uses_current_index_and_normalizes_khz_database_rate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            create_qobuz_v8_fixture(directory)
+            snapshot = get_qobuz_snapshot(directory)
+
+        self.assertEqual(snapshot["track_id"], "293140445")
+        self.assertEqual(snapshot["name"], "Return To Chinatown")
+        self.assertEqual(snapshot["artist"], "Knifehandchop")
+        self.assertEqual(snapshot["album"], "Random Shit 1998-2008")
+        self.assertEqual(snapshot["source_sample_rate"], 44100)
+        self.assertEqual(snapshot["source_bit_depth"], 24)
+        self.assertEqual(snapshot["source_channels"], 2)
+        self.assertTrue(snapshot["is_completed"])
+        self.assertEqual(snapshot["state"], "playing")
+        self.assertEqual(snapshot["position"], 112.736)
+        self.assertEqual(snapshot["volume_percent"], 100.0)
+        self.assertFalse(snapshot["muted"])
+        self.assertNotIn("exclusive_mode", snapshot)
+        self.assertEqual(snapshot["output_device_name"], "Loopback Audio")
+        self.assertTrue(source_is_playing(snapshot))
+
 
 class QobuzGateTests(unittest.TestCase):
     def setUp(self):
@@ -135,7 +231,6 @@ class QobuzGateTests(unittest.TestCase):
             "is_completed": True,
             "volume_percent": 100.0,
             "muted": False,
-            "exclusive_mode": True,
             "output_device_name": "BlackHole 2ch",
         }
 
