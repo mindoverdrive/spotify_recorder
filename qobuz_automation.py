@@ -415,7 +415,21 @@ class QobuzAutomation:
                 self.sleep(0.5)
             else:
                 raise QobuzAutomationError("Qobuzアプリを起動できません")
-            self.sleep(4.0)
+            
+            deadline = time.monotonic() + 15.0
+            ready = False
+            while time.monotonic() < deadline:
+                try:
+                    for item in self.accessibility._iter_items(limit=1000):
+                        if self.accessibility._role(item) == AS.kAXWebAreaRole:
+                            ready = True
+                            break
+                except Exception:
+                    pass
+                if ready:
+                    break
+                self.sleep(0.5)
+            self.sleep(1.0)
 
     def check_accessibility(self):
         self.ensure_running()
@@ -430,7 +444,19 @@ class QobuzAutomation:
             raise QobuzAutomationError(
                 "Qobuz曲の公開アルバムURL・曲番号・曲名が不足しています"
             )
-        self._run(["open", f"qobuzapp://album/{album_id}"])
+        opened = False
+        last_error = None
+        for _ in range(5):
+            try:
+                self._run(["open", f"qobuzapp://album/{album_id}"])
+                opened = True
+                break
+            except Exception as e:
+                last_error = e
+                self.sleep(1.0)
+        if not opened:
+            raise QobuzAutomationError(f"Qobuzアルバム画面を開けません: {last_error}")
+            
         self.sleep(1.0)
         point = self.accessibility.track_play_point(title, track_number)
         self.point_clicker(*point)
